@@ -1,0 +1,6 @@
+{
+  "path": "ledger/vatType",
+  "pagination": "offset",
+  "changed_since": false,
+  "fields": ["id", "name", "number", "displayName", "percentage", "deductionPercentage"]
+}

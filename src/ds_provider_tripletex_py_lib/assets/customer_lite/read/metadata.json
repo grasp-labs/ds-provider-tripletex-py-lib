@@ -1,0 +1,13 @@
+{
+  "path": "customer",
+  "pagination": "offset",
+  "changed_since": true,
+  "fields": [
+    "id",
+    "name",
+    "customerNumber",
+    "organizationNumber",
+    "language",
+    "isInactive"
+  ]
+}

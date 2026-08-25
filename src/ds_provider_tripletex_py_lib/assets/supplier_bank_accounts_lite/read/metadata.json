@@ -1,0 +1,11 @@
+{
+  "path": "supplier",
+  "pagination": "offset",
+  "changed_since": true,
+  "explode_columns": ["bankAccountPresentation"],
+  "fields": [
+    "id",
+    "isInactive",
+    {"bankAccountPresentation": ["iban", "bban", "provider"]}
+  ]
+}

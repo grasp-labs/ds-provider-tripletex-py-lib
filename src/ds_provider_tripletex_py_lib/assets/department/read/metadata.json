@@ -1,0 +1,6 @@
+{
+  "path": "department",
+  "pagination": "offset",
+  "changed_since": false,
+  "fields": ["id", "name", "departmentNumber", {"departmentManager": ["id"]}, "displayName", "isInactive"]
+}
