@@ -569,8 +569,10 @@ def test_changed_since_product_merges_extra_params():
 def test_changed_since_product_does_not_advance_watermark_on_mid_pagination_failure():
     """A watermark captured this run must not be persisted if a later page fails.
 
-    self.checkpoint stays byte-identical to what it was before the call --
-    not just empty -- proving it truly wasn't touched, per contract.
+    checksums/watermarks stay byte-identical to what they were before the
+    call, per contract -- but pagination now records the resume offset, so
+    the next run continues from where this one left off instead of
+    re-fetching pages it already collected.
     """
     responses = [
         FakeResponse({"values": [{"id": 1}], "versionDigest": "irrelevant"}),
@@ -585,7 +587,10 @@ def test_changed_since_product_does_not_advance_watermark_on_mid_pagination_fail
     )
     with pytest.raises(ReadError):
         dataset.read()
-    assert dataset.checkpoint == prior_checkpoint
+    assert dataset.checkpoint["checksums"] == prior_checkpoint["checksums"]
+    assert dataset.checkpoint["watermarks"] == prior_checkpoint["watermarks"]
+    (resume_offset,) = dataset.checkpoint["resume_offsets"].values()
+    assert resume_offset == 1
 
 
 # -----------------------------------------------------------------------------
@@ -649,8 +654,8 @@ def test_read_does_not_advance_checksum_on_mid_pagination_failure():
 
     Otherwise the next run would see that digest as already-current (a 304) and
     skip re-fetching data this run never actually finished retrieving.
-    self.checkpoint stays byte-identical to what it was before the call --
-    not just empty -- proving it truly wasn't touched, per contract.
+    checksums/watermarks stay byte-identical to what they were before the
+    call, per contract -- pagination separately records the resume offset.
     """
     responses = [
         FakeResponse({"values": [{"id": 1}], "versionDigest": "d1"}),
@@ -665,7 +670,55 @@ def test_read_does_not_advance_checksum_on_mid_pagination_failure():
     )
     with pytest.raises(ReadError):
         dataset.read()
-    assert dataset.checkpoint == prior_checkpoint
+    assert dataset.checkpoint["checksums"] == prior_checkpoint["checksums"]
+    assert dataset.checkpoint["watermarks"] == prior_checkpoint["watermarks"]
+    (resume_offset,) = dataset.checkpoint["resume_offsets"].values()
+    assert resume_offset == 1
+
+
+def test_read_resumes_digest_pagination_from_stored_offset():
+    """A stored pagination offset is sent as `from` on the next run, instead of 0."""
+    department_info = get_read_info(TripletexProductName.DEPARTMENT)
+    fields_param = _build_fields_param(department_info.fields)
+    key = _request_key(fields_param)
+    responses = [FakeResponse({"values": [{"id": 3}], "versionDigest": "d1"}), FakeResponse({"values": []})]
+    prior_checkpoint = {"checksums": {}, "watermarks": {}, "resume_offsets": {key: 2}}
+    dataset = make_dataset(
+        responses,
+        product_name=TripletexProductName.DEPARTMENT,
+        read=TripletexReadSettings(count=1),
+        checkpoint=prior_checkpoint,
+    )
+    dataset.read()
+    assert dataset.linked_service.connection.requests[0]["params"]["from"] == 2
+    assert dataset.checkpoint["resume_offsets"] == {}
+
+
+def test_read_resumes_changed_since_pagination_from_stored_offset():
+    """Same resume behavior for the changedSince-paginated loop."""
+    customer_info = get_read_info(TripletexProductName.CUSTOMER)
+    fields_param = _build_fields_param(customer_info.fields)
+    key = _request_key(fields_param)
+    responses = [FakeResponse({"values": [{"id": 3}]}), FakeResponse({"values": []})]
+    prior_checkpoint = {"checksums": {}, "watermarks": {}, "resume_offsets": {key: 2}}
+    dataset = make_dataset(
+        responses,
+        product_name=TripletexProductName.CUSTOMER,
+        read=TripletexReadSettings(count=1),
+        checkpoint=prior_checkpoint,
+    )
+    dataset.read()
+    assert dataset.linked_service.connection.requests[0]["params"]["from"] == 2
+    assert dataset.checkpoint["resume_offsets"] == {}
+
+
+def test_read_clears_pagination_on_full_success():
+    """A prior resume position is dropped once its pass completes successfully."""
+    responses = [FakeResponse({"values": [], "versionDigest": "d1"})]
+    prior_checkpoint = {"checksums": {}, "watermarks": {}, "resume_offsets": {"some-other-key": 5}}
+    dataset = make_dataset(responses, product_name=TripletexProductName.DEPARTMENT, checkpoint=prior_checkpoint)
+    dataset.read()
+    assert dataset.checkpoint["resume_offsets"] == {}
 
 
 def test_read_falls_back_to_magic_value_when_version_digest_is_null():

@@ -157,18 +157,19 @@ class _ReadContext:
     Only holds values that aren't otherwise reachable via ``self`` on
     ``TripletexDataset``: ``url``/``changed_since`` come from the resolved
     ``read_info``, a local in ``_execute_read`` rather than stored on the
-    instance; ``checksums``/``watermarks``/``records`` are local, mutable
-    copies the readers write into (``self.checkpoint``/``self.output`` aren't
-    updated until after the reader returns). Everything else the readers
-    need (``self.linked_service.connection``, ``self.settings.read.params``,
-    ``self.settings.read.count``) is read directly via ``self``, same as
-    ``self.settings.read.count`` already is.
+    instance; ``checksums``/``watermarks``/``resume_offsets``/``records`` are
+    local, mutable copies the readers write into (``self.checkpoint``/
+    ``self.output`` aren't updated until after the reader returns).
+    Everything else the readers need (``self.linked_service.connection``,
+    ``self.settings.read.params``, ``self.settings.read.count``) is read
+    directly via ``self``, same as ``self.settings.read.count`` already is.
     """
 
     url: str
     fields_param: str
     checksums: dict[str, str]
     watermarks: dict[str, str]
+    resume_offsets: dict[str, int]
     records: list[dict[str, Any]]
     changed_since: bool
 
@@ -209,9 +210,12 @@ class TripletexDataset(
         """
         Whether this dataset supports incremental loads via ``self.checkpoint``.
 
-        Checkpoint holds ``{"checksums": {...}, "watermarks": {...}}`` --
-        stored ``versionDigest``/``changedSince`` values per request. An
-        empty checkpoint (``{}``) means a full load.
+        Checkpoint holds ``{"checksums": {...}, "watermarks": {...},
+        "resume_offsets": {...}}`` -- stored ``versionDigest``/``changedSince``
+        values per request, plus an in-progress ``from`` offset per request
+        left behind by a failed or partial run so the next run resumes
+        instead of re-paging from the start. An empty checkpoint (``{}``)
+        means a full load.
 
         Returns:
             bool: Always ``True``.
@@ -428,12 +432,14 @@ class TripletexDataset(
         """
         checksums: dict[str, str] = dict(self.checkpoint.get("checksums", {})) if self.checkpoint else {}
         watermarks: dict[str, str] = dict(self.checkpoint.get("watermarks", {})) if self.checkpoint else {}
+        resume_offsets: dict[str, int] = dict(self.checkpoint.get("resume_offsets", {})) if self.checkpoint else {}
         records: list[dict[str, Any]] = []
         ctx = _ReadContext(
             url=f"{self.linked_service.settings.host}/{read_info.path}",
             fields_param=fields_param,
-            checksums=checksums,
-            watermarks=watermarks,
+            checksums=dict(checksums),
+            watermarks=dict(watermarks),
+            resume_offsets=resume_offsets,
             records=records,
             changed_since=read_info.changed_since,
         )
@@ -446,8 +452,10 @@ class TripletexDataset(
             # first, the broader `except ResourceException` below would catch
             # them and reclassify them as ReadError. Re-raising here lets them
             # propagate as themselves instead.
+            self.checkpoint = {"checksums": checksums, "watermarks": watermarks, "resume_offsets": ctx.resume_offsets}
             raise
         except ResourceException as exc:
+            self.checkpoint = {"checksums": checksums, "watermarks": watermarks, "resume_offsets": ctx.resume_offsets}
             product_name = getattr(self.settings.product_name, "value", self.settings.product_name)
             raise ReadError(
                 message=exc.message,
@@ -455,7 +463,7 @@ class TripletexDataset(
                 details={**exc.details, "type": self.type.value, "product_name": product_name, "path": read_info.path},
             ) from exc
         else:
-            self.checkpoint = {"checksums": checksums, "watermarks": watermarks}
+            self.checkpoint = {"checksums": ctx.checksums, "watermarks": ctx.watermarks, "resume_offsets": {}}
         finally:
             deserializer = cast("PandasDeserializer", self.deserializer)
             output = deserializer(records)
@@ -485,14 +493,16 @@ class TripletexDataset(
         filters server-side to only rows changed since that timestamp. The
         next run's watermark is captured as this run's start time (so
         concurrent changes aren't missed) and only stored in
-        ``ctx.watermarks`` once every page succeeds.
+        ``ctx.watermarks`` once every page succeeds. Resumes from
+        ``ctx.resume_offsets`` if a prior run failed mid-pagination; cleared
+        once this pass completes.
         """
         extra_params = self.settings.read.params
         request_key = _request_key(ctx.fields_param, extra_params=extra_params)
         changed_since_value = ctx.watermarks.get(request_key)
         run_started_at = datetime.now(tz=timezone.utc)
         count = self.settings.read.count
-        offset = 0
+        offset = ctx.resume_offsets.get(request_key, 0)
 
         while True:
             params: dict[str, Any] = {"from": offset, "count": count, "fields": ctx.fields_param}
@@ -509,7 +519,9 @@ class TripletexDataset(
 
             ctx.records.extend(values)
             offset += len(values)
+            ctx.resume_offsets[request_key] = offset
 
+        ctx.resume_offsets.pop(request_key, None)
         ctx.watermarks[request_key] = run_started_at.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def _read_paginated_by_digest(self, ctx: _ReadContext) -> None:
@@ -532,17 +544,19 @@ class TripletexDataset(
         Page through ``ctx.url`` via ``versionDigest``/``If-None-Match``, caching under ``request_key``.
 
         Exits on ``304`` (unchanged); falls back to ``"magic-value"`` since
-        ``versionDigest`` can be JSON ``null``.
+        ``versionDigest`` can be JSON ``null``. Resumes from
+        ``ctx.resume_offsets`` if a prior run failed mid-pagination; cleared
+        once this key's pass completes.
 
         Args:
-            ctx: Read context to append ``records`` into and cache ``checksums`` on.
+            ctx: Read context to append ``records`` into and cache ``checksums``/``resume_offsets`` on.
             request_key: Cache key identifying this request shape.
             extra_query_params: Extra query params beyond ``from``/``count``/``fields``.
         """
         extra_params = self.settings.read.params
         if_none_match = ctx.checksums.get(request_key, "magic-value")
         count = self.settings.read.count
-        offset = 0
+        offset = ctx.resume_offsets.get(request_key, 0)
         new_digest: str | None = None
 
         while True:
@@ -566,7 +580,9 @@ class TripletexDataset(
 
             ctx.records.extend(values)
             offset += len(values)
+            ctx.resume_offsets[request_key] = offset
 
+        ctx.resume_offsets.pop(request_key, None)
         if new_digest is not None:
             ctx.checksums[request_key] = new_digest
 
