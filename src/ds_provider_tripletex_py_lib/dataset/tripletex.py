@@ -448,7 +448,7 @@ class TripletexDataset(
             # propagate as themselves instead.
             raise
         except ResourceException as exc:
-            product_name = self.settings.product_name.value if self.settings.product_name else None
+            product_name = getattr(self.settings.product_name, "value", self.settings.product_name)
             raise ReadError(
                 message=exc.message,
                 status_code=exc.status_code,
