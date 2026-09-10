@@ -52,10 +52,7 @@ def _load_metadata(product_name: TripletexProductName, operation: OperationType)
     Read and parse one product's packaged operation metadata.
 
     A plain, mechanical file read -- whether a missing file is an error is
-    left to the caller to decide. Not cached: parsing one small per-product
-    JSON file is cheap enough that memoizing it isn't worth the alternative
-    it would create -- a mutable dict shared across every call for that
-    product, for the life of the process.
+    left to the caller to decide.
 
     Args:
         product_name: Tripletex product whose assets to load.

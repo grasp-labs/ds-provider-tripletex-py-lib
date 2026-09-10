@@ -254,7 +254,6 @@ def test_read_explode_raises_when_column_missing_from_nonempty_result():
 
 
 def test_read_explode_raises_read_error_when_value_is_not_a_list():
-    """A scalar value in an explode column (not a list) raises ReadError, not a bare TypeError."""
     responses = [
         FakeResponse(
             {
@@ -272,13 +271,6 @@ def test_read_explode_raises_read_error_when_value_is_not_a_list():
 
 
 def test_read_explode_raises_read_error_when_value_is_a_string_not_a_list():
-    """A string value in an explode column also raises ReadError -- not just a bare scalar.
-
-    A string has a len(), so it silently survives every pandas call in the
-    explode pipeline (pandas doesn't treat str as list-like) with no
-    exception anywhere -- the whole column would otherwise vanish from the
-    output with no error, rather than raising.
-    """
     responses = [
         FakeResponse(
             {
@@ -357,13 +349,6 @@ def test_read_populates_output_single_page():
 
 
 def test_digest_pagination_advances_by_actual_rows_not_requested_count():
-    """The next page's `from` must reflect rows actually received, not the requested `count`.
-
-    If the server ever returns fewer rows than requested while more data
-    remains (e.g. an undocumented per-request cap), advancing by the
-    requested `count` instead of the actual row count would silently skip
-    the rows in between.
-    """
     responses = [
         FakeResponse({"values": [{"id": 1}, {"id": 2}, {"id": 3}], "versionDigest": "d1"}),
         FakeResponse({"values": [{"id": 4}, {"id": 5}], "versionDigest": "d1"}),
@@ -381,7 +366,6 @@ def test_digest_pagination_advances_by_actual_rows_not_requested_count():
 
 
 def test_changed_since_pagination_advances_by_actual_rows_not_requested_count():
-    """Same offset-advancement correctness check, for the changedSince-paginated loop."""
     responses = [
         FakeResponse({"values": [{"id": 1}, {"id": 2}, {"id": 3}]}),
         FakeResponse({"values": [{"id": 4}, {"id": 5}]}),
@@ -729,11 +713,6 @@ def test_read_raises_when_date_from_set_for_offset_paginated_read():
 
 
 def test_read_raises_when_changed_since_combined_with_date_window_pagination():
-    """read() raises ReadError for a custom path combining changed_since=True with DATE_WINDOW.
-
-    _read_date_windowed never emits changedSince, so this combination would
-    otherwise be silently accepted and silently do nothing.
-    """
     dataset = make_dataset(
         [],
         product_name=None,
@@ -957,13 +936,6 @@ def test_date_windowed_product_merges_extra_params(monkeypatch):
 
 
 def test_date_windowed_product_date_to_is_exclusive_so_today_is_included(monkeypatch):
-    """The date_to passed to _period_generator is today + 1 day, not today.
-
-    Tripletex documents ledger/posting's dateTo as exclusive ("to and
-    excl."). Passing today itself would silently exclude today's own
-    postings from every date-windowed read -- not just a date_from="0" edge
-    case, but every single run, forever.
-    """
     captured_kwargs = {}
 
     def fake_period_generator(**kwargs):
@@ -978,8 +950,6 @@ def test_date_windowed_product_date_to_is_exclusive_so_today_is_included(monkeyp
 
 
 class _FrozenDatetime(datetime):
-    """A datetime subclass whose .now() always returns a fixed instant, for tests."""
-
     frozen_now: "datetime"
 
     @classmethod
@@ -988,15 +958,7 @@ class _FrozenDatetime(datetime):
 
 
 def test_date_windowed_product_date_from_zero_reads_today_even_on_first_of_month(monkeypatch):
-    """date_from="0" (today) still yields data, even when today is the 1st of a month.
-
-    With date_to capped at today (the old, buggy value), date_from == date_to
-    landing on day 1 made period_from == period_to -- an apparently zero-width
-    window that a naive fix would skip, silently reading nothing. Anchoring
-    date_to at today + 1 day instead avoids that degenerate case entirely: a
-    single real day always produces a non-empty period, regardless of which
-    day of the month it falls on.
-    """
+    """Regression: date_from==date_to landing on day 1 must not collapse to zero periods."""
     _FrozenDatetime.frozen_now = datetime(2024, 3, 1, tzinfo=timezone.utc)  # today lands on day 1
     monkeypatch.setattr(tripletex_mod, "datetime", _FrozenDatetime)
     responses = [FakeResponse({"values": [{"id": 1}], "versionDigest": "d1"}), FakeResponse({"values": []})]
