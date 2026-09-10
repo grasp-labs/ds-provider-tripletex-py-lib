@@ -17,7 +17,6 @@ products reuse a full product's path with fewer fields.
 
 import json
 from dataclasses import dataclass, field
-from functools import cache
 from importlib.resources import files
 from typing import Any, cast
 
@@ -48,13 +47,15 @@ class ReadInfo:
     explode_columns: list[str] = field(default_factory=list)
 
 
-@cache
 def _load_metadata(product_name: TripletexProductName, operation: OperationType) -> dict[str, Any]:
     """
     Read and parse one product's packaged operation metadata.
 
     A plain, mechanical file read -- whether a missing file is an error is
-    left to the caller to decide.
+    left to the caller to decide. Not cached: parsing one small per-product
+    JSON file is cheap enough that memoizing it isn't worth the alternative
+    it would create -- a mutable dict shared across every call for that
+    product, for the life of the process.
 
     Args:
         product_name: Tripletex product whose assets to load.

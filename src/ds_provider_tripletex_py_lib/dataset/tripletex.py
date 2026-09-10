@@ -353,8 +353,10 @@ class TripletexDataset(
 
         Raises:
             ReadError: If any ``read.*`` setting is set alongside
-                ``product_name`` (ignored there), or ``read.date_from`` is
-                set but pagination isn't :attr:`PaginationKind.DATE_WINDOW`.
+                ``product_name`` (ignored there), ``read.date_from`` is set
+                but pagination isn't :attr:`PaginationKind.DATE_WINDOW`, or
+                ``changed_since`` is combined with date-windowed pagination
+                (``_read_date_windowed`` never emits ``changedSince``).
         """
         if self.settings.product_name and (
             self.settings.read.path
@@ -381,6 +383,16 @@ class TripletexDataset(
                     "date_from": self.settings.read.date_from,
                     "pagination": read_info.pagination.value,
                 },
+            )
+
+        if read_info.pagination is PaginationKind.DATE_WINDOW and read_info.changed_since:
+            raise ReadError(
+                message=(
+                    "changed_since is not supported for date-windowed pagination -- "
+                    "_read_date_windowed never emits changedSince, so this combination "
+                    "would silently do nothing."
+                ),
+                details={"type": self.type.value, "path": read_info.path},
             )
 
     def read(self) -> None:
@@ -436,11 +448,11 @@ class TripletexDataset(
             # propagate as themselves instead.
             raise
         except ResourceException as exc:
-            exc.details.update({"type": self.type.value, "product_name": self.settings.product_name, "path": read_info.path})
+            product_name = self.settings.product_name.value if self.settings.product_name else None
             raise ReadError(
                 message=exc.message,
                 status_code=exc.status_code,
-                details=exc.details,
+                details={**exc.details, "type": self.type.value, "product_name": product_name, "path": read_info.path},
             ) from exc
         else:
             self.checkpoint = {"checksums": checksums, "watermarks": watermarks}
@@ -496,7 +508,7 @@ class TripletexDataset(
                 break
 
             ctx.records.extend(values)
-            offset += count
+            offset += len(values)
 
         ctx.watermarks[request_key] = run_started_at.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -553,7 +565,7 @@ class TripletexDataset(
                 break
 
             ctx.records.extend(values)
-            offset += count
+            offset += len(values)
 
         if new_digest is not None:
             ctx.checksums[request_key] = new_digest
@@ -602,8 +614,9 @@ class TripletexDataset(
         Raises:
             ReadError: If ``settings.read.date_from`` is not a valid integer.
         """
-        date_to = datetime.now(tz=timezone.utc).date()
-        date_from = self._resolve_date_from(date_to=date_to)
+        today = datetime.now(tz=timezone.utc).date()
+        date_from = self._resolve_date_from(date_to=today)
+        date_to = today + timedelta(days=1)  # Tripletex's dateTo is exclusive
 
         for period_from, period_to in _period_generator(date_from=date_from, date_to=date_to):
             period_from_str = period_from.isoformat()
@@ -666,7 +679,8 @@ def _explode_column(df: pd.DataFrame, column: str) -> pd.DataFrame:
 
     Raises:
         ReadError: If ``column`` is missing from a non-empty ``df`` (likely
-            a packaging bug). A fully empty ``df`` is a no-op instead.
+            a packaging bug), or a non-null value in ``column`` isn't a
+            ``list``. A fully empty ``df`` is a no-op instead.
     """
     if df.empty:
         return df
@@ -677,6 +691,17 @@ def _explode_column(df: pd.DataFrame, column: str) -> pd.DataFrame:
                 "result -- check it matches an entry in the field selector."
             ),
             details={"column": column, "available_columns": list(df.columns)},
+        )
+    non_null = df[column].dropna()
+    not_a_list = non_null[~non_null.apply(lambda value: isinstance(value, list))]
+    if not not_a_list.empty:
+        raise ReadError(
+            message=(
+                f"explode_columns names {column!r}, but not every value is a list -- "
+                f"check the field actually returns a list of objects for every row "
+                f"(found {not_a_list.iloc[0]!r})."
+            ),
+            details={"column": column},
         )
     df = df[df[column].notna()]
     df = df[df[column].apply(len) != 0]
@@ -767,10 +792,13 @@ def _period_generator(*, date_from: date, date_to: date) -> Iterator[tuple[date,
     Yields:
         tuple[date, date]: Each period as ``(period_from, period_to)``, where
         ``period_from`` is inclusive and ``period_to`` is exclusive.
+        Callers wanting to include a specific day (e.g.
+        today) must pass a ``date_to`` one day past it -- see
+        ``_read_date_windowed``.
     """
     while date_from < date_to:
         next_month = date_from.replace(day=28) + timedelta(days=4)
         period_from = date_from.replace(day=1)
-        period_to = next_month.replace(day=1)
+        period_to = min(next_month.replace(day=1), date_to)
         yield period_from, period_to
-        date_from = period_to
+        date_from = next_month.replace(day=1)
