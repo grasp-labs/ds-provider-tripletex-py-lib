@@ -5,7 +5,7 @@
 Unit tests for TripletexDataset.
 """
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
 
 import pandas as pd
@@ -253,6 +253,40 @@ def test_read_explode_raises_when_column_missing_from_nonempty_result():
         dataset.read()
 
 
+def test_read_explode_raises_read_error_when_value_is_not_a_list():
+    responses = [
+        FakeResponse(
+            {
+                "values": [
+                    {"id": 1, "isInactive": False, "bankAccountPresentation": 0},
+                ]
+            }
+        ),
+        FakeResponse({"values": []}),
+    ]
+    dataset = make_dataset(responses, product_name=TripletexProductName.SUPPLIER_BANK_ACCOUNTS_LITE)
+
+    with pytest.raises(ReadError, match="bankAccountPresentation"):
+        dataset.read()
+
+
+def test_read_explode_raises_read_error_when_value_is_a_string_not_a_list():
+    responses = [
+        FakeResponse(
+            {
+                "values": [
+                    {"id": 1, "isInactive": False, "bankAccountPresentation": "not-a-list"},
+                ]
+            }
+        ),
+        FakeResponse({"values": []}),
+    ]
+    dataset = make_dataset(responses, product_name=TripletexProductName.SUPPLIER_BANK_ACCOUNTS_LITE)
+
+    with pytest.raises(ReadError, match="bankAccountPresentation"):
+        dataset.read()
+
+
 def test_serializer_and_deserializer_default_when_explicitly_none():
     """Explicitly passing serializer=None/deserializer=None also fills in the default."""
     linked_service = make_linked_service([])
@@ -312,6 +346,40 @@ def test_read_populates_output_single_page():
     assert isinstance(dataset.output, pd.DataFrame)
     assert len(dataset.output) == 1
     assert dataset.output.iloc[0]["name"] == "Acme"
+
+
+def test_digest_pagination_advances_by_actual_rows_not_requested_count():
+    responses = [
+        FakeResponse({"values": [{"id": 1}, {"id": 2}, {"id": 3}], "versionDigest": "d1"}),
+        FakeResponse({"values": [{"id": 4}, {"id": 5}], "versionDigest": "d1"}),
+        FakeResponse({"values": [], "versionDigest": "d1"}),
+    ]
+    dataset = make_dataset(responses, product_name=TripletexProductName.DEPARTMENT, read=TripletexReadSettings(count=10))
+
+    dataset.read()
+
+    requests = dataset.linked_service.connection.requests
+    assert requests[0]["params"]["from"] == 0
+    assert requests[1]["params"]["from"] == 3  # actual rows from page 1, not requested count=10
+    assert requests[2]["params"]["from"] == 5  # 3 + 2 actual rows so far
+    assert len(dataset.output) == 5
+
+
+def test_changed_since_pagination_advances_by_actual_rows_not_requested_count():
+    responses = [
+        FakeResponse({"values": [{"id": 1}, {"id": 2}, {"id": 3}]}),
+        FakeResponse({"values": [{"id": 4}, {"id": 5}]}),
+        FakeResponse({"values": []}),
+    ]
+    dataset = make_dataset(responses, product_name=TripletexProductName.CUSTOMER, read=TripletexReadSettings(count=10))
+
+    dataset.read()
+
+    requests = dataset.linked_service.connection.requests
+    assert requests[0]["params"]["from"] == 0
+    assert requests[1]["params"]["from"] == 3
+    assert requests[2]["params"]["from"] == 5
+    assert len(dataset.output) == 5
 
 
 def test_read_multiple_pages_are_concatenated():
@@ -644,6 +712,21 @@ def test_read_raises_when_date_from_set_for_offset_paginated_read():
         dataset.read()
 
 
+def test_read_raises_when_changed_since_combined_with_date_window_pagination():
+    dataset = make_dataset(
+        [],
+        product_name=None,
+        read=TripletexReadSettings(
+            path="custom/thing",
+            fields=["id"],
+            pagination=PaginationKind.DATE_WINDOW,
+            changed_since=True,
+        ),
+    )
+    with pytest.raises(ReadError):
+        dataset.read()
+
+
 def test_read_uses_custom_path_bypassing_packaged_catalog():
     """A custom read.path/read.fields is used directly, without any packaged product."""
     responses = [
@@ -852,6 +935,45 @@ def test_date_windowed_product_merges_extra_params(monkeypatch):
     assert dataset.linked_service.connection.requests[0]["params"]["foo"] == "bar"
 
 
+def test_date_windowed_product_date_to_is_exclusive_so_today_is_included(monkeypatch):
+    captured_kwargs = {}
+
+    def fake_period_generator(**kwargs):
+        captured_kwargs.update(kwargs)
+        return iter([])
+
+    monkeypatch.setattr(tripletex_mod, "_period_generator", fake_period_generator)
+    dataset = make_dataset([], product_name=TripletexProductName.LEDGER_POSTING)
+    dataset.read()
+    today = datetime.now(tz=timezone.utc).date()
+    assert captured_kwargs["date_to"] == today + timedelta(days=1)
+
+
+class _FrozenDatetime(datetime):
+    frozen_now: "datetime"
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls.frozen_now
+
+
+def test_date_windowed_product_date_from_zero_reads_today_even_on_first_of_month(monkeypatch):
+    """Regression: date_from==date_to landing on day 1 must not collapse to zero periods."""
+    _FrozenDatetime.frozen_now = datetime(2024, 3, 1, tzinfo=timezone.utc)  # today lands on day 1
+    monkeypatch.setattr(tripletex_mod, "datetime", _FrozenDatetime)
+    responses = [FakeResponse({"values": [{"id": 1}], "versionDigest": "d1"}), FakeResponse({"values": []})]
+    dataset = make_dataset(
+        responses,
+        product_name=TripletexProductName.LEDGER_POSTING,
+        read=TripletexReadSettings(date_from="0", count=1),
+    )
+    dataset.read()
+    request = dataset.linked_service.connection.requests[0]
+    assert request["params"]["dateFrom"] == "2024-03-01"
+    assert request["params"]["dateTo"] == "2024-03-02"
+    assert len(dataset.output) == 1
+
+
 def test_date_windowed_product_uses_configured_date_from(monkeypatch):
     """settings.read.date_from, when set, overrides the default 3-year window start."""
     captured_kwargs = {}
@@ -867,7 +989,10 @@ def test_date_windowed_product_uses_configured_date_from(monkeypatch):
         read=TripletexReadSettings(date_from="1"),
     )
     dataset.read()
-    assert captured_kwargs["date_from"] == _add_years(captured_kwargs["date_to"], -1)
+    # date_to passed to the generator is today + 1 day (Tripletex's dateTo is
+    # exclusive) -- date_from is offset from today itself, not from that.
+    today = captured_kwargs["date_to"] - timedelta(days=1)
+    assert captured_kwargs["date_from"] == _add_years(today, -1)
 
 
 def test_date_windowed_product_uses_default_date_from_when_unset(monkeypatch):
@@ -881,7 +1006,8 @@ def test_date_windowed_product_uses_default_date_from_when_unset(monkeypatch):
     monkeypatch.setattr(tripletex_mod, "_period_generator", fake_period_generator)
     dataset = make_dataset([], product_name=TripletexProductName.LEDGER_POSTING)
     dataset.read()
-    assert captured_kwargs["date_from"] == _add_years(captured_kwargs["date_to"], -3)
+    today = captured_kwargs["date_to"] - timedelta(days=1)
+    assert captured_kwargs["date_from"] == _add_years(today, -3)
 
 
 def test_resolve_date_from_accepts_negative_year_offset():

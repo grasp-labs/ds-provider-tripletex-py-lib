@@ -17,7 +17,6 @@ products reuse a full product's path with fewer fields.
 
 import json
 from dataclasses import dataclass, field
-from functools import cache
 from importlib.resources import files
 from typing import Any, cast
 
@@ -48,7 +47,6 @@ class ReadInfo:
     explode_columns: list[str] = field(default_factory=list)
 
 
-@cache
 def _load_metadata(product_name: TripletexProductName, operation: OperationType) -> dict[str, Any]:
     """
     Read and parse one product's packaged operation metadata.
