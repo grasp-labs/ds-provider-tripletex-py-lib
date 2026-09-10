@@ -1,0 +1,6 @@
+{
+  "path": "ledger/account",
+  "pagination": "offset",
+  "changed_since": false,
+  "fields": ["id", "number", "name", "isInactive", "saftCode"]
+}

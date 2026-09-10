@@ -1,0 +1,6 @@
+{
+  "path": "currency",
+  "pagination": "offset",
+  "changed_since": false,
+  "fields": ["id", "code", "description", "factor", "displayName", "isDisabled"]
+}

@@ -1,0 +1,6 @@
+{
+  "path": "employee",
+  "pagination": "offset",
+  "changed_since": false,
+  "fields": ["id", "displayName", "employeeNumber"]
+}

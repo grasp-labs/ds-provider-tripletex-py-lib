@@ -1,0 +1,6 @@
+{
+  "path": "project",
+  "pagination": "offset",
+  "changed_since": false,
+  "fields": ["id", "name", "number", "isClosed"]
+}

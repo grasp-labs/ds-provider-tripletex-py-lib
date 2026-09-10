@@ -1,0 +1,17 @@
+package-name: tripletex
+name: tripletex
+description: Tripletex provider for the DS Business Workflow
+
+linked_service:
+  - name: tripletex
+    type: ds.resource.linked-service.tripletex
+    version: 1.0.0
+    description: Tripletex linked service
+    class_name: ds_provider_tripletex_py_lib.linked_service.tripletex.TripletexLinkedService
+
+dataset:
+  - name: tripletex
+    type: ds.resource.dataset.tripletex
+    version: 1.0.0
+    description: Tripletex dataset
+    class_name: ds_provider_tripletex_py_lib.dataset.tripletex.TripletexDataset

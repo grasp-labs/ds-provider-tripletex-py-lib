@@ -1,0 +1,13 @@
+{
+  "path": "supplier",
+  "pagination": "offset",
+  "changed_since": true,
+  "fields": [
+    "id",
+    "name",
+    "supplierNumber",
+    "organizationNumber",
+    "isInactive",
+    {"postalAddress": ["addressLine1", "addressLine2", "postalCode", "city", {"country": ["isoAlpha2Code"]}]}
+  ]
+}
