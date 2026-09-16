@@ -54,6 +54,11 @@ from ..read_info import ReadInfo, get_read_info
 
 logger = Logger.get_logger(__name__, package=True)
 
+# Every query param name this module ever generates itself -- from/count/fields on
+# every request, changedSince on the changedSince loop, dateFrom/dateTo on date-windowed
+# reads. A caller's settings.read.params must never be able to override any of these.
+_RESERVED_QUERY_PARAMS = frozenset({"from", "count", "fields", "changedSince", "dateFrom", "dateTo"})
+
 
 @dataclass(kw_only=True)
 class TripletexReadSettings(Serializable):
@@ -358,9 +363,11 @@ class TripletexDataset(
         Raises:
             ReadError: If any ``read.*`` setting is set alongside
                 ``product_name`` (ignored there), ``read.date_from`` is set
-                but pagination isn't :attr:`PaginationKind.DATE_WINDOW`, or
+                but pagination isn't :attr:`PaginationKind.DATE_WINDOW`,
                 ``changed_since`` is combined with date-windowed pagination
-                (``_read_date_windowed`` never emits ``changedSince``).
+                (``_read_date_windowed`` never emits ``changedSince``), or
+                ``read.params`` sets a reserved key (``_RESERVED_QUERY_PARAMS``)
+                that this module generates internally per request.
         """
         if self.settings.product_name and (
             self.settings.read.path
@@ -397,6 +404,17 @@ class TripletexDataset(
                     "would silently do nothing."
                 ),
                 details={"type": self.type.value, "path": read_info.path},
+            )
+
+        reserved_params_used = _RESERVED_QUERY_PARAMS & (self.settings.read.params or {}).keys()
+        if reserved_params_used:
+            raise ReadError(
+                message=(
+                    f"settings.read.params must not set {sorted(reserved_params_used)} -- these are "
+                    "generated internally for every request and would be silently overridden if "
+                    "allowed through params. Remove them from settings.read.params."
+                ),
+                details={"type": self.type.value, "reserved_params": sorted(reserved_params_used)},
             )
 
     def read(self) -> None:
@@ -439,7 +457,7 @@ class TripletexDataset(
             fields_param=fields_param,
             checksums=dict(checksums),
             watermarks=dict(watermarks),
-            resume_offsets=resume_offsets,
+            resume_offsets=dict(resume_offsets),
             records=records,
             changed_since=read_info.changed_since,
         )
@@ -462,14 +480,14 @@ class TripletexDataset(
                 status_code=exc.status_code,
                 details={**exc.details, "type": self.type.value, "product_name": product_name, "path": read_info.path},
             ) from exc
-        else:
-            self.checkpoint = {"checksums": ctx.checksums, "watermarks": ctx.watermarks, "resume_offsets": {}}
         finally:
             deserializer = cast("PandasDeserializer", self.deserializer)
             output = deserializer(records)
             for column in read_info.explode_columns:
                 output = _explode_column(output, column)
             self.output = output
+
+        self.checkpoint = {"checksums": ctx.checksums, "watermarks": ctx.watermarks, "resume_offsets": {}}
 
     def _read_paginated(self, ctx: _ReadContext) -> None:
         """
@@ -505,11 +523,10 @@ class TripletexDataset(
         offset = ctx.resume_offsets.get(request_key, 0)
 
         while True:
-            params: dict[str, Any] = {"from": offset, "count": count, "fields": ctx.fields_param}
+            params: dict[str, Any] = dict(extra_params) if extra_params else {}
+            params.update({"from": offset, "count": count, "fields": ctx.fields_param})
             if changed_since_value is not None:
                 params["changedSince"] = changed_since_value
-            if extra_params:
-                params.update(extra_params)
 
             response = self.linked_service.connection.get(url=ctx.url, params=params)
             body = response.json()
@@ -560,11 +577,10 @@ class TripletexDataset(
         new_digest: str | None = None
 
         while True:
-            params: dict[str, Any] = {"from": offset, "count": count, "fields": ctx.fields_param}
+            params: dict[str, Any] = dict(extra_params) if extra_params else {}
             if extra_query_params:
                 params.update(extra_query_params)
-            if extra_params:
-                params.update(extra_params)
+            params.update({"from": offset, "count": count, "fields": ctx.fields_param})
 
             response = self.linked_service.connection.get(url=ctx.url, params=params, headers={"If-None-Match": if_none_match})
             if response.status_code == 304:

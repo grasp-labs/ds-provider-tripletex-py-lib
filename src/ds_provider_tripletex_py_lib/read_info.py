@@ -87,16 +87,16 @@ def get_read_info(product_name: TripletexProductName) -> ReadInfo:
         ReadInfo: Read info built from ``assets/<product_name>/read/metadata.json``.
 
     Raises:
-        ValidationError: If the metadata file is missing, or exists but is
-            missing a required key (``path``, ``fields``, ``pagination``,
-            ``changed_since``) or ``pagination`` is not a recognized
-            :class:`PaginationKind` value.
+        ValidationError: If the metadata file is missing, isn't valid JSON,
+            or exists but is missing a required key (``path``, ``fields``,
+            ``pagination``, ``changed_since``) or ``pagination`` is not a
+            recognized :class:`PaginationKind` value.
     """
     try:
         payload = _load_metadata(product_name, OperationType.READ)
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
         raise ValidationError(
-            message=f"Missing read metadata for Tripletex product '{product_name.value}'",
+            message=f"Missing or malformed read metadata for Tripletex product '{product_name.value}': {exc}",
             details={"product_name": product_name.value, "operation": OperationType.READ.value},
         ) from exc
     try:

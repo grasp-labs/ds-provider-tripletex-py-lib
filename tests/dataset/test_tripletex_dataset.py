@@ -270,6 +270,40 @@ def test_read_explode_raises_read_error_when_value_is_not_a_list():
         dataset.read()
 
 
+def test_read_does_not_advance_checkpoint_when_post_processing_fails():
+    """A malformed response that fails _explode_column must not commit a new checkpoint.
+
+    The reader itself succeeds (fetches every page, gets a real versionDigest) --
+    it's the *later* deserialize/explode step, in `finally`, that raises. If the
+    checkpoint were committed in an `else` clause (which runs before `finally`),
+    the new digest would already be persisted despite read() ultimately failing,
+    so a later run would see it as already-current and skip data that never
+    produced a valid output.
+    """
+    responses = [
+        FakeResponse(
+            {
+                "values": [
+                    {"id": 1, "isInactive": False, "bankAccountPresentation": 0},
+                ],
+                "versionDigest": "brand-new-digest",
+            }
+        ),
+        FakeResponse({"values": []}),
+    ]
+    prior_checkpoint = {"checksums": {}, "watermarks": {}, "resume_offsets": {}}
+    dataset = make_dataset(
+        responses,
+        product_name=TripletexProductName.SUPPLIER_BANK_ACCOUNTS_LITE,
+        checkpoint=dict(prior_checkpoint),
+    )
+
+    with pytest.raises(ReadError, match="bankAccountPresentation"):
+        dataset.read()
+
+    assert dataset.checkpoint == prior_checkpoint
+
+
 def test_read_explode_raises_read_error_when_value_is_a_string_not_a_list():
     responses = [
         FakeResponse(
@@ -460,6 +494,23 @@ def test_read_merges_extra_params():
     assert dataset.linked_service.connection.requests[0]["params"]["foo"] == "bar"
 
 
+def test_digest_pagination_raises_when_params_sets_reserved_key():
+    """settings.read.params can't set from/count/fields -- must raise, not silently collide.
+
+    Caught upfront by _validate_read_settings, before any request is made --
+    a stray "from" would otherwise pin every request to a fixed offset,
+    refetching the same page forever.
+    """
+    dataset = make_dataset(
+        [],
+        product_name=TripletexProductName.DEPARTMENT,
+        read=TripletexReadSettings(count=1, params={"from": 0, "count": 999, "fields": "bogus"}),
+    )
+    with pytest.raises(ReadError, match="from"):
+        dataset.read()
+    assert len(dataset.linked_service.connection.requests) == 0
+
+
 # -----------------------------------------------------------------------------
 # Contract: checkpoint (conditional GET via versionDigest)
 # -----------------------------------------------------------------------------
@@ -564,6 +615,18 @@ def test_changed_since_product_merges_extra_params():
     )
     dataset.read()
     assert dataset.linked_service.connection.requests[0]["params"]["foo"] == "bar"
+
+
+def test_changed_since_pagination_raises_when_params_sets_reserved_key():
+    """settings.read.params can't set changedSince -- must raise, not silently collide."""
+    dataset = make_dataset(
+        [],
+        product_name=TripletexProductName.CUSTOMER,
+        read=TripletexReadSettings(count=1, params={"changedSince": "garbage"}),
+    )
+    with pytest.raises(ReadError, match="changedSince"):
+        dataset.read()
+    assert len(dataset.linked_service.connection.requests) == 0
 
 
 def test_changed_since_product_does_not_advance_watermark_on_mid_pagination_failure():
@@ -986,6 +1049,23 @@ def test_date_windowed_product_merges_extra_params(monkeypatch):
     )
     dataset.read()
     assert dataset.linked_service.connection.requests[0]["params"]["foo"] == "bar"
+
+
+def test_date_windowed_product_raises_when_params_sets_reserved_key():
+    """settings.read.params can't set dateFrom/dateTo -- must raise, not silently collide.
+
+    The TripletexReadSettings.params docstring documents dateFrom/dateTo as
+    "auto-generated per window and would override any values passed here" --
+    in practice this is now caught upfront instead, before any request.
+    """
+    dataset = make_dataset(
+        [],
+        product_name=TripletexProductName.LEDGER_POSTING,
+        read=TripletexReadSettings(count=1, params={"dateFrom": "bogus", "dateTo": "bogus"}),
+    )
+    with pytest.raises(ReadError, match="dateFrom"):
+        dataset.read()
+    assert len(dataset.linked_service.connection.requests) == 0
 
 
 def test_date_windowed_product_date_to_is_exclusive_so_today_is_included(monkeypatch):

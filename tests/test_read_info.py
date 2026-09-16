@@ -5,6 +5,8 @@
 Unit tests for the Tripletex packaged asset loader.
 """
 
+import json
+
 import pytest
 from ds_resource_plugin_py_lib.common.resource.errors import ValidationError
 
@@ -99,6 +101,25 @@ def test_get_read_info_raises_when_read_metadata_missing(monkeypatch):
         raise FileNotFoundError
 
     monkeypatch.setattr("ds_provider_tripletex_py_lib.read_info._load_metadata", _raise_not_found)
+    with pytest.raises(ValidationError) as exc_info:
+        get_read_info(TripletexProductName.CUSTOMER)
+    assert "customer" in exc_info.value.message
+    assert exc_info.value.details["product_name"] == "customer"
+
+
+def test_get_read_info_raises_validation_error_on_malformed_json(monkeypatch):
+    """get_read_info() raises ValidationError (not a bare JSONDecodeError) for invalid JSON.
+
+    _load_metadata's own json.loads() call can raise JSONDecodeError -- a
+    packaging bug (a corrupted metadata.json), same category as a missing
+    file, so it must surface the same documented ValidationError, not leak
+    an internal parser exception type callers never asked to handle.
+    """
+
+    def _raise_decode_error(product_name: object, operation: object) -> None:
+        json.loads("not valid json {{{")
+
+    monkeypatch.setattr("ds_provider_tripletex_py_lib.read_info._load_metadata", _raise_decode_error)
     with pytest.raises(ValidationError) as exc_info:
         get_read_info(TripletexProductName.CUSTOMER)
     assert "customer" in exc_info.value.message
