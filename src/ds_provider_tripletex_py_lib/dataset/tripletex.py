@@ -56,8 +56,9 @@ logger = Logger.get_logger(__name__, package=True)
 
 # Every query param name this module ever generates itself -- from/count/fields on
 # every request, changedSince on the changedSince loop, dateFrom/dateTo on date-windowed
-# reads. A caller's settings.read.params must never be able to override any of these.
-_RESERVED_QUERY_PARAMS = frozenset({"from", "count", "fields", "changedSince", "dateFrom", "dateTo"})
+# reads, sorting on digest-paginated reads (see _fetch_pages_by_digest). A caller's
+# settings.read.params must never be able to override any of these.
+_RESERVED_QUERY_PARAMS = frozenset({"from", "count", "fields", "changedSince", "dateFrom", "dateTo", "sorting"})
 
 
 @dataclass(kw_only=True)
@@ -83,9 +84,10 @@ class TripletexReadSettings(Serializable):
     params: dict[str, Any] | None = None
     """Additional query parameters merged into every request (e.g. ``isInactive``).
 
-    Not for ``dateFrom``/``dateTo`` on ``date_window``-paginated products
-    (``ledger_posting``, ``balance_sheet``) -- those are auto-generated per
-    window and would override any values passed here.
+    Not for ``from``/``count``/``fields``/``changedSince``/``dateFrom``/
+    ``dateTo``/``sorting`` -- this module generates all of those itself
+    per request, and setting any of them here raises ``ReadError`` instead
+    of being silently overridden.
     """
 
     path: str | None = None
@@ -159,24 +161,18 @@ class _ReadContext:
     """
     Mutable, per-call state threaded through one ``read()`` call's pagination.
 
-    Only holds values that aren't otherwise reachable via ``self`` on
-    ``TripletexDataset``: ``url``/``changed_since`` come from the resolved
-    ``read_info``, a local in ``_execute_read`` rather than stored on the
-    instance; ``checksums``/``watermarks``/``resume_offsets``/``records`` are
-    local, mutable copies the readers write into (``self.checkpoint``/
-    ``self.output`` aren't updated until after the reader returns).
-    Everything else the readers need (``self.linked_service.connection``,
-    ``self.settings.read.params``, ``self.settings.read.count``) is read
-    directly via ``self``, same as ``self.settings.read.count`` already is.
+    ``digest_watermarks``/``changed_since_watermarks``/``resume_offsets``/``resume_digests``/
+    ``records`` are local, mutable copies the readers write into --
+    ``self.checkpoint``/``self.output`` aren't updated until the reader returns.
     """
 
     url: str
     fields_param: str
-    checksums: dict[str, str]
-    watermarks: dict[str, str]
+    digest_watermarks: dict[str, str]
+    changed_since_watermarks: dict[str, str]
     resume_offsets: dict[str, int]
+    resume_digests: dict[str, str]
     records: list[dict[str, Any]]
-    changed_since: bool
 
 
 @dataclass(kw_only=True)
@@ -215,32 +211,36 @@ class TripletexDataset(
         """
         Whether this dataset supports incremental loads via ``self.checkpoint``.
 
-        Checkpoint holds ``{"checksums": {...}, "watermarks": {...},
-        "resume_offsets": {...}}`` -- stored ``versionDigest``/``changedSince``
-        values per request, plus an in-progress ``from`` offset per request
-        left behind by a failed or partial run so the next run resumes
-        instead of re-paging from the start. An empty checkpoint (``{}``)
-        means a full load.
+        Checkpoint holds ``{"digest_watermarks": {...}, "changed_since_watermarks": {...},
+        "resume_offsets": {...}, "resume_digests": {...}}`` -- stored
+        digest/changed_since_watermark values per request, plus (digest-cached products
+        only) a resumable ``from`` offset and its digest, left behind by a
+        failed run. An empty checkpoint (``{}``) means a full load.
 
         Returns:
             bool: Always ``True``.
         """
         return True
 
-    def _resolve_reader(self, pagination: PaginationKind) -> Callable[[_ReadContext], None]:
+    def _resolve_reader(self, read_info: ReadInfo) -> Callable[[_ReadContext], None]:
         """
-        Return the read implementation for the given pagination kind.
+        Return the read implementation for the resolved endpoint.
 
         Args:
-            pagination: The resolved endpoint's pagination kind.
+            read_info: The resolved endpoint to read.
 
         Returns:
             Callable[[_ReadContext], None]: ``_read_date_windowed`` for
-            ``DATE_WINDOW``, otherwise ``_read_paginated``.
+            ``DATE_WINDOW`` pagination; otherwise
+            ``_read_paginated_by_changed_since`` for products supporting
+            Tripletex's ``changedSince`` filter, or ``_read_paginated_by_digest``
+            (``versionDigest``/``If-None-Match``) for every other product.
         """
-        if pagination == PaginationKind.DATE_WINDOW:
+        if read_info.pagination == PaginationKind.DATE_WINDOW:
             return self._read_date_windowed
-        return self._read_paginated
+        if read_info.changed_since:
+            return self._read_paginated_by_changed_since
+        return self._read_paginated_by_digest
 
     def _resolve_product_name(self, product_name: str) -> TripletexProductName:
         """
@@ -448,21 +448,24 @@ class TripletexDataset(
             ConnectionError: If the transport cannot reach Tripletex.
             ReadError: If the read fails for any other reason.
         """
-        checksums: dict[str, str] = dict(self.checkpoint.get("checksums", {})) if self.checkpoint else {}
-        watermarks: dict[str, str] = dict(self.checkpoint.get("watermarks", {})) if self.checkpoint else {}
-        resume_offsets: dict[str, int] = dict(self.checkpoint.get("resume_offsets", {})) if self.checkpoint else {}
+        init_digest_watermarks: dict[str, str] = dict(self.checkpoint.get("digest_watermarks", {})) if self.checkpoint else {}
+        init_changed_since_watermarks: dict[str, str] = (
+            dict(self.checkpoint.get("changed_since_watermarks", {})) if self.checkpoint else {}
+        )
+        init_resume_offsets: dict[str, int] = dict(self.checkpoint.get("resume_offsets", {})) if self.checkpoint else {}
+        init_resume_digests: dict[str, str] = dict(self.checkpoint.get("resume_digests", {})) if self.checkpoint else {}
         records: list[dict[str, Any]] = []
         ctx = _ReadContext(
             url=f"{self.linked_service.settings.host}/{read_info.path}",
             fields_param=fields_param,
-            checksums=dict(checksums),
-            watermarks=dict(watermarks),
-            resume_offsets=dict(resume_offsets),
+            digest_watermarks=dict(init_digest_watermarks),
+            changed_since_watermarks=dict(init_changed_since_watermarks),
+            resume_offsets=dict(init_resume_offsets),
+            resume_digests=dict(init_resume_digests),
             records=records,
-            changed_since=read_info.changed_since,
         )
 
-        reader = self._resolve_reader(read_info.pagination)
+        reader = self._resolve_reader(read_info)
         try:
             reader(ctx)
         except (AuthenticationError, AuthorizationError, ConnectionError):
@@ -470,10 +473,20 @@ class TripletexDataset(
             # first, the broader `except ResourceException` below would catch
             # them and reclassify them as ReadError. Re-raising here lets them
             # propagate as themselves instead.
-            self.checkpoint = {"checksums": checksums, "watermarks": watermarks, "resume_offsets": ctx.resume_offsets}
+            self.checkpoint = {
+                "digest_watermarks": init_digest_watermarks,
+                "changed_since_watermarks": init_changed_since_watermarks,
+                "resume_offsets": ctx.resume_offsets,
+                "resume_digests": ctx.resume_digests,
+            }
             raise
         except ResourceException as exc:
-            self.checkpoint = {"checksums": checksums, "watermarks": watermarks, "resume_offsets": ctx.resume_offsets}
+            self.checkpoint = {
+                "digest_watermarks": init_digest_watermarks,
+                "changed_since_watermarks": init_changed_since_watermarks,
+                "resume_offsets": ctx.resume_offsets,
+                "resume_digests": ctx.resume_digests,
+            }
             product_name = getattr(self.settings.product_name, "value", self.settings.product_name)
             raise ReadError(
                 message=exc.message,
@@ -487,21 +500,12 @@ class TripletexDataset(
                 output = _explode_column(output, column)
             self.output = output
 
-        self.checkpoint = {"checksums": ctx.checksums, "watermarks": ctx.watermarks, "resume_offsets": {}}
-
-    def _read_paginated(self, ctx: _ReadContext) -> None:
-        """
-        Fetch every page of a ``from``/``count`` offset-paginated product into ``ctx.records``.
-
-        Dispatches to ``_read_paginated_by_changed_since`` (products
-        supporting Tripletex's ``changedSince`` filter) or
-        ``_read_paginated_by_digest`` (``versionDigest``/``If-None-Match``,
-        every other product).
-        """
-        if ctx.changed_since:
-            self._read_paginated_by_changed_since(ctx)
-            return
-        self._read_paginated_by_digest(ctx)
+        self.checkpoint = {
+            "digest_watermarks": ctx.digest_watermarks,
+            "changed_since_watermarks": ctx.changed_since_watermarks,
+            "resume_offsets": {},
+            "resume_digests": {},
+        }
 
     def _read_paginated_by_changed_since(self, ctx: _ReadContext) -> None:
         """
@@ -509,22 +513,24 @@ class TripletexDataset(
 
         Tripletex's ``changedSince`` param (format ``YYYY-MM-DDThh:mm:ssZ``)
         filters server-side to only rows changed since that timestamp. The
-        next run's watermark is captured as this run's start time (so
-        concurrent changes aren't missed) and only stored in
-        ``ctx.watermarks`` once every page succeeds. Resumes from
-        ``ctx.resume_offsets`` if a prior run failed mid-pagination; cleared
-        once this pass completes.
+        next run's changed_since_watermark is captured as this run's start time and only
+        stored in ``ctx.changed_since_watermarks`` once every page succeeds.
+
+        Always starts at ``offset=0`` -- not resumable. ``changedSince``
+        filters a mutable, moving result set, so a stored offset can't be
+        trusted: a row added/removed/updated between attempts can shift
+        every later row's position, risking a silent skip or duplicate.
         """
         extra_params = self.settings.read.params
         request_key = _request_key(ctx.fields_param, extra_params=extra_params)
-        changed_since_value = ctx.watermarks.get(request_key)
+        changed_since_value = ctx.changed_since_watermarks.get(request_key)
         run_started_at = datetime.now(tz=timezone.utc)
         count = self.settings.read.count
-        offset = ctx.resume_offsets.get(request_key, 0)
+        offset = 0
 
         while True:
             params: dict[str, Any] = dict(extra_params) if extra_params else {}
-            params.update({"from": offset, "count": count, "fields": ctx.fields_param})
+            params.update({"from": offset, "count": count, "fields": ctx.fields_param, "sorting": "id"})
             if changed_since_value is not None:
                 params["changedSince"] = changed_since_value
 
@@ -536,10 +542,7 @@ class TripletexDataset(
 
             ctx.records.extend(values)
             offset += len(values)
-            ctx.resume_offsets[request_key] = offset
-
-        ctx.resume_offsets.pop(request_key, None)
-        ctx.watermarks[request_key] = run_started_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+        ctx.changed_since_watermarks[request_key] = run_started_at.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def _read_paginated_by_digest(self, ctx: _ReadContext) -> None:
         """
@@ -565,30 +568,49 @@ class TripletexDataset(
         ``ctx.resume_offsets`` if a prior run failed mid-pagination; cleared
         once this key's pass completes.
 
+        Pins ``sorting=id`` -- IDs are server-assigned and increasing, so
+        new rows always append after what's already been seen, never
+        shifting earlier offsets. A resumed offset is trusted only if the
+        digest recorded when it was saved still matches the first resumed
+        response; a mismatch restarts this key from ``offset=0``.
+
         Args:
-            ctx: Read context to append ``records`` into and cache ``checksums``/``resume_offsets`` on.
+            ctx: Read context to append ``records`` into and cache
+                ``digest_watermarks``/``resume_offsets``/``resume_digests`` on.
             request_key: Cache key identifying this request shape.
             extra_query_params: Extra query params beyond ``from``/``count``/``fields``.
         """
         extra_params = self.settings.read.params
-        if_none_match = ctx.checksums.get(request_key, "magic-value")
+        if_none_match = ctx.digest_watermarks.get(request_key, "magic-value")
         count = self.settings.read.count
         offset = ctx.resume_offsets.get(request_key, 0)
+        expected_resume_digest = ctx.resume_digests.get(request_key)
+        should_verify_resume = offset != 0
         new_digest: str | None = None
 
         while True:
             params: dict[str, Any] = dict(extra_params) if extra_params else {}
             if extra_query_params:
                 params.update(extra_query_params)
-            params.update({"from": offset, "count": count, "fields": ctx.fields_param})
+            params.update({"from": offset, "count": count, "fields": ctx.fields_param, "sorting": "id"})
 
             response = self.linked_service.connection.get(url=ctx.url, params=params, headers={"If-None-Match": if_none_match})
-            if response.status_code == 304:
+            if response.status_code == 304:  # Nothing changed since the last full pass
                 break
 
             body = response.json()
-            if new_digest is None:
+            if new_digest is None:  # Capture scope wide digest, from the first page only
                 new_digest = body.get("versionDigest") or "magic-value"
+
+            if should_verify_resume:
+                should_verify_resume = False
+                if new_digest != expected_resume_digest:
+                    # Digest differs from what was recorded when that run was
+                    # interrupted -- can't be trusted. Discard this response
+                    # and restart from scratch.
+                    offset = 0
+                    new_digest = None
+                    continue
 
             values = body.get("values", [])
             if not values:
@@ -597,10 +619,12 @@ class TripletexDataset(
             ctx.records.extend(values)
             offset += len(values)
             ctx.resume_offsets[request_key] = offset
+            ctx.resume_digests[request_key] = new_digest
 
         ctx.resume_offsets.pop(request_key, None)
+        ctx.resume_digests.pop(request_key, None)
         if new_digest is not None:
-            ctx.checksums[request_key] = new_digest
+            ctx.digest_watermarks[request_key] = new_digest
 
     def _resolve_date_from(self, *, date_to: date) -> date:
         """
@@ -638,10 +662,9 @@ class TripletexDataset(
 
         Tripletex requires a bounded ``dateFrom``/``dateTo`` per request, so
         this walks the read window in monthly steps, offset-paginating and
-        digest-caching within each. ``ctx.watermarks``/``ctx.changed_since``
-        are never touched here -- no date-windowed product supports
-        ``changedSince`` -- but ``ctx`` is still accepted so the calling
-        convention matches ``_read_paginated``.
+        digest-caching within each. ``ctx.changed_since_watermarks`` is never touched here
+        -- but ``ctx`` is still accepted so the calling convention matches
+        ``_resolve_reader``'s other two readers.
 
         Raises:
             ReadError: If ``settings.read.date_from`` is not a valid integer.
