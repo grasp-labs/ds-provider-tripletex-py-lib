@@ -816,6 +816,36 @@ def test_read_resumes_digest_pagination_from_stored_offset():
     assert len(dataset.output) == 1
 
 
+def test_read_resuming_sends_unconditional_get_ignoring_stored_watermark_digest():
+    """Resuming never sends the real watermark_digest as If-None-Match, even if one is stored.
+
+    A conditional GET only answers "did the whole collection change since my
+    last full success" -- irrelevant mid-resume, since rows past the stored
+    offset are already known to be unfetched. Trusting a 304 there would
+    bypass the mismatch check and could wrongly treat an unverified,
+    incomplete resume as "done".
+    """
+    department_info = get_read_info(TripletexProductName.DEPARTMENT)
+    fields_param = _build_fields_param(department_info.fields)
+    key = _request_key(fields_param)
+    responses = [FakeResponse({"values": [{"id": 3}], "versionDigest": "d1"}), FakeResponse({"values": []})]
+    prior_checkpoint = {
+        "watermark_digests": {key: "d1"},
+        "watermark_changed_since": {},
+        "resume_offsets": {key: 2},
+        "resume_digests": {key: "d1"},
+    }
+    dataset = make_dataset(
+        responses,
+        product_name=TripletexProductName.DEPARTMENT,
+        read=TripletexReadSettings(count=1),
+        checkpoint=prior_checkpoint,
+    )
+    dataset.read()
+    assert dataset.linked_service.connection.requests[0]["headers"]["If-None-Match"] == "magic-value"
+    assert len(dataset.output) == 1
+
+
 def test_read_restarts_digest_pagination_when_resume_digest_does_not_match():
     """A stored offset whose paired digest no longer matches the resumed page is discarded.
 

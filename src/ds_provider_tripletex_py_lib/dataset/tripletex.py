@@ -581,11 +581,11 @@ class TripletexDataset(
             extra_query_params: Extra query params beyond ``from``/``count``/``fields``.
         """
         extra_params = self.settings.read.params
-        if_none_match = ctx.watermark_digests.get(request_key, "magic-value")
         count = self.settings.read.count
         offset = ctx.resume_offsets.get(request_key, 0)
         expected_resume_digest = ctx.resume_digests.get(request_key)
         should_verify_resume = offset != 0
+        if_none_match = "magic-value" if should_verify_resume else ctx.watermark_digests.get(request_key, "magic-value")
         new_digest: str | None = None
 
         while True:
