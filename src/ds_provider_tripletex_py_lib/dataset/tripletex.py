@@ -443,7 +443,7 @@ class TripletexDataset(
 
         if read_info.stable_sort_field:
             stable_sort_root = read_info.stable_sort_field.split(".", 1)[0]
-            if stable_sort_root not in read_info.fields:
+            if stable_sort_root not in _field_root_names(read_info.fields):
                 raise ReadError(
                     message=(
                         f"stable_sort_field={read_info.stable_sort_field!r} but {stable_sort_root!r} is not "
@@ -564,7 +564,7 @@ class TripletexDataset(
         every later row's position, risking a silent skip or duplicate.
         """
         extra_params = self.settings.read.params
-        request_key = _request_key(ctx.fields_param, extra_params=extra_params)
+        request_key = _request_key(ctx.fields_param, stable_sort_field=ctx.stable_sort_field, extra_params=extra_params)
         changed_since_value = ctx.watermark_changed_since.get(request_key)
         run_started_at = datetime.now(tz=timezone.utc)
         count = self.settings.read.count
@@ -599,7 +599,9 @@ class TripletexDataset(
 
         See ``_fetch_pages_by_digest`` for the mechanism.
         """
-        request_key = _request_key(ctx.fields_param, extra_params=self.settings.read.params)
+        request_key = _request_key(
+            ctx.fields_param, stable_sort_field=ctx.stable_sort_field, extra_params=self.settings.read.params
+        )
         self._fetch_pages_by_digest(ctx, request_key=request_key)
 
     def _fetch_pages_by_digest(
@@ -689,8 +691,9 @@ class TripletexDataset(
 
             ctx.records.extend(values)
             offset += len(values)
-            ctx.resume_offsets[request_key] = offset
-            ctx.resume_digests[request_key] = new_digest
+            if new_digest != "magic-value":
+                ctx.resume_offsets[request_key] = offset
+                ctx.resume_digests[request_key] = new_digest
 
         ctx.resume_offsets.pop(request_key, None)
         ctx.resume_digests.pop(request_key, None)
@@ -750,6 +753,7 @@ class TripletexDataset(
             period_to_str = period_to.isoformat()
             request_key = _request_key(
                 ctx.fields_param,
+                stable_sort_field=ctx.stable_sort_field,
                 date_from=period_from_str,
                 date_to=period_to_str,
                 extra_params=self.settings.read.params,
@@ -860,9 +864,23 @@ def _build_fields_param(fields: list[Any]) -> str:
     return ",".join(parts)
 
 
+def _field_root_names(fields: list[Any]) -> set[str]:
+    """
+    Top-level names a field selector list selects, whether bare strings or nested-object dict keys.
+
+    Args:
+        fields: Field selector list, e.g. ``["id", {"account": ["id"]}]``.
+
+    Returns:
+        set[str]: ``{"id", "account"}`` for the example above.
+    """
+    return {item if isinstance(item, str) else next(iter(item)) for item in fields}
+
+
 def _request_key(
     fields_param: str,
     *,
+    stable_sort_field: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
     extra_params: dict[str, Any] | None = None,
@@ -878,7 +896,7 @@ def _request_key(
     Returns:
         str: A SHA-256 hex digest identifying this request shape.
     """
-    payload: dict[str, Any] = {"fields": fields_param}
+    payload: dict[str, Any] = {"fields": fields_param, "stable_sort_field": stable_sort_field}
     if date_from is not None:
         payload["dateFrom"] = date_from
         payload["dateTo"] = date_to
