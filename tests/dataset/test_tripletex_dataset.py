@@ -542,6 +542,140 @@ def test_digest_pagination_sends_sorting_id_on_every_request():
     assert all(r["params"]["sorting"] == "id" for r in requests)
 
 
+def test_read_raises_when_no_stable_sort_field_can_be_resolved():
+    """A product with no top-level id and no stable_sort_field override raises ReadError.
+
+    Resumable pagination can't guarantee row order without a stable,
+    server-assigned, monotonic field to sort by -- silently omitting
+    sorting would risk a skip or duplicate on resume.
+    """
+    dataset = make_dataset(
+        [],
+        product_name=None,
+        read=TripletexReadSettings(
+            count=1, path="balanceSheet", fields=["account"], pagination=PaginationKind.OFFSET, changed_since=False
+        ),
+    )
+    with pytest.raises(ReadError, match="stable_sort_field"):
+        dataset.read()
+
+
+def test_digest_pagination_sends_stable_sort_field_override():
+    """settings.read.stable_sort_field is sent as sorting when the product has no top-level id."""
+    responses = [
+        FakeResponse({"values": [{"account": {"id": 1}}], "versionDigest": "d1"}),
+        FakeResponse({"values": []}),
+    ]
+    dataset = make_dataset(
+        responses,
+        product_name=None,
+        read=TripletexReadSettings(
+            count=1,
+            path="balanceSheet",
+            fields=["account"],
+            pagination=PaginationKind.OFFSET,
+            changed_since=False,
+            stable_sort_field="account.id",
+        ),
+    )
+    dataset.read()
+    requests = dataset.linked_service.connection.requests
+    assert len(requests) == 2
+    assert all(r["params"]["sorting"] == "account.id" for r in requests)
+
+
+def test_stable_sort_field_set_alongside_product_name_is_silently_ignored():
+    """settings.read.stable_sort_field alongside product_name has no effect -- the packaged metadata wins."""
+    responses = [FakeResponse({"values": [], "versionDigest": "d1"})]
+    dataset = make_dataset(
+        responses, product_name=TripletexProductName.DEPARTMENT, read=TripletexReadSettings(stable_sort_field="name")
+    )
+    dataset.read()
+    assert dataset.linked_service.connection.requests[0]["params"]["sorting"] == "id"
+
+
+def test_stable_sort_field_defaults_to_id_for_custom_path():
+    """A custom path with no explicit stable_sort_field override defaults to sorting=id."""
+    responses = [FakeResponse({"values": [], "versionDigest": "d1"})]
+    dataset = make_dataset(
+        responses,
+        product_name=None,
+        read=TripletexReadSettings(
+            path="custom/thing", fields=["id", "name"], pagination=PaginationKind.OFFSET, changed_since=False
+        ),
+    )
+    dataset.read()
+    assert dataset.linked_service.connection.requests[0]["params"]["sorting"] == "id"
+
+
+def test_digest_pagination_sends_no_sorting_when_stable_sort_field_is_none():
+    """settings.read.stable_sort_field=None opts out: no sorting is sent, even though fields has no id."""
+    responses = [FakeResponse({"values": [], "versionDigest": "d1"})]
+    dataset = make_dataset(
+        responses,
+        product_name=None,
+        read=TripletexReadSettings(
+            path="balanceSheet",
+            fields=["account"],
+            pagination=PaginationKind.OFFSET,
+            changed_since=False,
+            stable_sort_field=None,
+        ),
+    )
+    dataset.read()
+    assert "sorting" not in dataset.linked_service.connection.requests[0]["params"]
+
+
+def test_digest_pagination_sends_no_sorting_when_stable_sort_field_is_empty_string():
+    """settings.read.stable_sort_field="" opts out the same way as None."""
+    responses = [FakeResponse({"values": [], "versionDigest": "d1"})]
+    dataset = make_dataset(
+        responses,
+        product_name=None,
+        read=TripletexReadSettings(
+            path="balanceSheet",
+            fields=["account"],
+            pagination=PaginationKind.OFFSET,
+            changed_since=False,
+            stable_sort_field="",
+        ),
+    )
+    dataset.read()
+    assert "sorting" not in dataset.linked_service.connection.requests[0]["params"]
+
+
+def test_changed_since_pagination_sends_no_sorting_when_stable_sort_field_is_none():
+    """changedSince pagination also honors the stable_sort_field=None opt-out."""
+    responses = [FakeResponse({"values": [], "versionDigest": "irrelevant"})]
+    dataset = make_dataset(
+        responses,
+        product_name=None,
+        read=TripletexReadSettings(
+            path="custom/thing",
+            fields=["name"],
+            pagination=PaginationKind.OFFSET,
+            changed_since=True,
+            stable_sort_field=None,
+        ),
+        checkpoint={},
+    )
+    dataset.read()
+    assert "sorting" not in dataset.linked_service.connection.requests[0]["params"]
+
+
+def test_balance_sheet_packaged_product_sends_account_id_as_sorting(monkeypatch):
+    """The packaged balance_sheet product resolves stable_sort_field from its own metadata (account.id)."""
+    monkeypatch.setattr(tripletex_mod, "_period_generator", lambda **kwargs: iter([(date(2024, 1, 1), date(2024, 2, 1))]))
+    responses = [
+        FakeResponse({"values": [{"account": {"id": 1}}], "versionDigest": None}),
+        FakeResponse({"values": []}),
+    ]
+    dataset = make_dataset(responses, product_name=TripletexProductName.BALANCE_SHEET)
+    dataset.read()
+    requests = dataset.linked_service.connection.requests
+    assert all(r["params"]["sorting"] == "account.id" for r in requests)
+
+
 # -----------------------------------------------------------------------------
 # Contract: checkpoint (conditional GET via versionDigest)
 # -----------------------------------------------------------------------------
@@ -626,6 +760,45 @@ def test_changed_since_pagination_sends_sorting_id_on_every_request():
     requests = dataset.linked_service.connection.requests
     assert len(requests) == 2
     assert all(r["params"]["sorting"] == "id" for r in requests)
+
+
+def test_changed_since_pagination_raises_when_no_stable_sort_field_can_be_resolved():
+    """A changedSince-capable custom path with no top-level id and no override raises ReadError."""
+    dataset = make_dataset(
+        [],
+        product_name=None,
+        read=TripletexReadSettings(
+            count=1, path="custom/thing", fields=["name"], pagination=PaginationKind.OFFSET, changed_since=True
+        ),
+        checkpoint={},
+    )
+    with pytest.raises(ReadError, match="stable_sort_field"):
+        dataset.read()
+
+
+def test_changed_since_pagination_sends_stable_sort_field_override():
+    """settings.read.stable_sort_field is sent as sorting for changedSince pagination too."""
+    responses = [
+        FakeResponse({"values": [{"account": {"id": 1}}], "versionDigest": "irrelevant"}),
+        FakeResponse({"values": []}),
+    ]
+    dataset = make_dataset(
+        responses,
+        product_name=None,
+        read=TripletexReadSettings(
+            count=1,
+            path="custom/thing",
+            fields=["account"],
+            pagination=PaginationKind.OFFSET,
+            changed_since=True,
+            stable_sort_field="account.id",
+        ),
+        checkpoint={},
+    )
+    dataset.read()
+    requests = dataset.linked_service.connection.requests
+    assert len(requests) == 2
+    assert all(r["params"]["sorting"] == "account.id" for r in requests)
 
 
 def test_changed_since_product_sends_stored_changed_since_watermark():

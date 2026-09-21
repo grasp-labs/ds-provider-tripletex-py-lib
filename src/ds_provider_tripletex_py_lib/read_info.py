@@ -38,6 +38,17 @@ class ReadInfo:
         pagination: How ``read()`` requests are paginated for this product.
         explode_columns: Field names that are a list of objects and should be
             exploded into one row per element, e.g. ``["bankAccountPresentation"]``.
+        stable_sort_field: The field ``sorting`` pins to guarantee new rows
+            always append after what's already been seen, never shifting
+            earlier offsets -- must be server-assigned and monotonic (e.g.
+            an id), not a display-order field. Defaults to ``"id"`` when a
+            packaged product's metadata doesn't set it -- if that product
+            has no top-level ``id`` field, validation catches the mismatch
+            and raises rather than silently sorting by a field that isn't
+            requested. Set explicitly when the product's own id is nested,
+            e.g. ``"account.id"`` for ``balance_sheet`` (a
+            ``BalanceSheetAccount`` row has no top-level ``id``, only
+            ``account.id``).
     """
 
     path: str
@@ -45,6 +56,7 @@ class ReadInfo:
     changed_since: bool
     pagination: PaginationKind = PaginationKind.OFFSET
     explode_columns: list[str] = field(default_factory=list)
+    stable_sort_field: str | None = None
 
 
 def _load_metadata(product_name: TripletexProductName, operation: OperationType) -> dict[str, Any]:
@@ -106,6 +118,7 @@ def get_read_info(product_name: TripletexProductName) -> ReadInfo:
             pagination=PaginationKind(payload["pagination"]),
             changed_since=payload["changed_since"],
             explode_columns=payload.get("explode_columns", []),
+            stable_sort_field=payload.get("stable_sort_field", "id"),
         )
     except (KeyError, ValueError) as exc:
         raise ValidationError(

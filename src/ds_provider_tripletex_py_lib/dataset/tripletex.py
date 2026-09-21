@@ -132,6 +132,22 @@ class TripletexReadSettings(Serializable):
     from a plain nested object (which flattens in place, no explode needed).
     """
 
+    stable_sort_field: str | None = "id"
+    """The field ``sorting`` pins for pagination stability, e.g. ``"account.id"``.
+
+    Only meaningful with ``path`` -- ignored when ``product_name`` is set
+    (fixed by its own metadata). Defaults to ``"id"``; set to a different
+    field (e.g. a nested id like ``"account.id"``) when the product's own
+    id isn't top-level. Either way, ``read()`` raises ``ReadError`` if that
+    field isn't in ``fields``.
+
+    Set explicitly to ``None`` or ``""`` to deliberately opt out: no
+    ``sorting`` is sent at all, and resumable pagination can no longer
+    guarantee row order is preserved across requests -- a silent skip or
+    duplicate becomes possible. Only do this when you've confirmed the
+    product has no field suitable for this.
+    """
+
 
 @dataclass(kw_only=True)
 class TripletexDatasetSettings(DatasetSettings):
@@ -168,6 +184,7 @@ class _ReadContext:
 
     url: str
     fields_param: str
+    stable_sort_field: str | None
     watermark_digests: dict[str, str]
     watermark_changed_since: dict[str, str]
     resume_offsets: dict[str, int]
@@ -237,9 +254,12 @@ class TripletexDataset(
             (``versionDigest``/``If-None-Match``) for every other product.
         """
         if read_info.pagination == PaginationKind.DATE_WINDOW:
+            logger.debug("%s: reading via date-windowed digest pagination", read_info.path)
             return self._read_date_windowed
         if read_info.changed_since:
+            logger.debug("%s: reading via changedSince pagination", read_info.path)
             return self._read_paginated_by_changed_since
+        logger.debug("%s: reading via digest-cached offset pagination", read_info.path)
         return self._read_paginated_by_digest
 
     def _resolve_product_name(self, product_name: str) -> TripletexProductName:
@@ -351,6 +371,7 @@ class TripletexDataset(
             pagination=self.settings.read.pagination,
             changed_since=self.settings.read.changed_since,
             explode_columns=self.settings.read.explode_columns or [],
+            stable_sort_field=self.settings.read.stable_sort_field,
         )
 
     def _validate_read_settings(self, read_info: ReadInfo) -> None:
@@ -365,9 +386,12 @@ class TripletexDataset(
                 ``product_name`` (ignored there), ``read.date_from`` is set
                 but pagination isn't :attr:`PaginationKind.DATE_WINDOW`,
                 ``changed_since`` is combined with date-windowed pagination
-                (``_read_date_windowed`` never emits ``changedSince``), or
+                (``_read_date_windowed`` never emits ``changedSince``),
                 ``read.params`` sets a reserved key (``_RESERVED_QUERY_PARAMS``)
-                that this module generates internally per request.
+                that this module generates internally per request, or
+                ``read_info.stable_sort_field``'s top-level field isn't in
+                ``read_info.fields`` -- resumable pagination can't sort by a
+                field that was never requested.
         """
         if self.settings.product_name and (
             self.settings.read.path
@@ -417,6 +441,23 @@ class TripletexDataset(
                 details={"type": self.type.value, "reserved_params": sorted(reserved_params_used)},
             )
 
+        if read_info.stable_sort_field:
+            stable_sort_root = read_info.stable_sort_field.split(".", 1)[0]
+            if stable_sort_root not in read_info.fields:
+                raise ReadError(
+                    message=(
+                        f"stable_sort_field={read_info.stable_sort_field!r} but {stable_sort_root!r} is not "
+                        "in fields -- resumable pagination can't sort by a field that isn't requested. Add "
+                        "it to fields, point stable_sort_field at a field that is, or leave it falsy (None "
+                        "or '') to opt out of the stability guarantee entirely."
+                    ),
+                    details={
+                        "type": self.type.value,
+                        "path": read_info.path,
+                        "stable_sort_field": read_info.stable_sort_field,
+                    },
+                )
+
     def read(self) -> None:
         """
         Read all rows for the configured product and assign them to ``self.output``.
@@ -458,6 +499,7 @@ class TripletexDataset(
         ctx = _ReadContext(
             url=f"{self.linked_service.settings.host}/{read_info.path}",
             fields_param=fields_param,
+            stable_sort_field=read_info.stable_sort_field,
             watermark_digests=dict(init_watermark_digests),
             watermark_changed_since=dict(init_watermark_changed_since),
             resume_offsets=dict(init_resume_offsets),
@@ -528,9 +570,16 @@ class TripletexDataset(
         count = self.settings.read.count
         offset = 0
 
+        if changed_since_value is not None:
+            logger.debug("%s: fetching rows changed since %s", request_key, changed_since_value)
+        else:
+            logger.debug("%s: no stored changed_since_watermark, fetching everything", request_key)
+
         while True:
             params: dict[str, Any] = dict(extra_params) if extra_params else {}
-            params.update({"from": offset, "count": count, "fields": ctx.fields_param, "sorting": "id"})
+            params.update({"from": offset, "count": count, "fields": ctx.fields_param})
+            if ctx.stable_sort_field:
+                params["sorting"] = ctx.stable_sort_field
             if changed_since_value is not None:
                 params["changedSince"] = changed_since_value
 
@@ -568,11 +617,14 @@ class TripletexDataset(
         ``ctx.resume_offsets`` if a prior run failed mid-pagination; cleared
         once this key's pass completes.
 
-        Pins ``sorting=id`` -- IDs are server-assigned and increasing, so
-        new rows always append after what's already been seen, never
-        shifting earlier offsets. A resumed offset is trusted only if the
-        digest recorded when it was saved still matches the first resumed
-        response; a mismatch restarts this key from ``offset=0``.
+        Pins ``sorting=ctx.stable_sort_field`` (usually ``id``) -- a
+        server-assigned, monotonic field means new rows always append after
+        what's already been seen, never shifting earlier offsets. If it's
+        falsy (``None`` or ``""``, an explicit, deliberate opt-out), no
+        ``sorting`` is sent and this guarantee no longer holds. A resumed
+        offset is trusted only if the digest recorded when it was saved
+        still matches the first resumed response; a mismatch restarts this
+        key from ``offset=0``.
 
         Args:
             ctx: Read context to append ``records`` into and cache
@@ -588,14 +640,27 @@ class TripletexDataset(
         if_none_match = "magic-value" if should_verify_resume else ctx.watermark_digests.get(request_key, "magic-value")
         new_digest: str | None = None
 
+        if should_verify_resume:
+            logger.debug(
+                "%s: resuming from offset=%d, verifying against resume_digest=%s",
+                request_key,
+                offset,
+                expected_resume_digest,
+            )
+        else:
+            logger.debug("%s: starting fresh, if_none_match=%s", request_key, if_none_match)
+
         while True:
             params: dict[str, Any] = dict(extra_params) if extra_params else {}
             if extra_query_params:
                 params.update(extra_query_params)
-            params.update({"from": offset, "count": count, "fields": ctx.fields_param, "sorting": "id"})
+            params.update({"from": offset, "count": count, "fields": ctx.fields_param})
+            if ctx.stable_sort_field:
+                params["sorting"] = ctx.stable_sort_field
 
             response = self.linked_service.connection.get(url=ctx.url, params=params, headers={"If-None-Match": if_none_match})
             if response.status_code == 304:  # Nothing changed since the last full pass
+                logger.debug("%s: 304 not modified, nothing to fetch", request_key)
                 break
 
             body = response.json()
@@ -608,6 +673,12 @@ class TripletexDataset(
                     # Digest differs from what was recorded when that run was
                     # interrupted -- can't be trusted. Discard this response
                     # and restart from scratch.
+                    logger.info(
+                        "%s: resume digest mismatch (expected=%s, got=%s) -- restarting from offset=0",
+                        request_key,
+                        expected_resume_digest,
+                        new_digest,
+                    )
                     offset = 0
                     new_digest = None
                     continue
@@ -625,6 +696,7 @@ class TripletexDataset(
         ctx.resume_digests.pop(request_key, None)
         if new_digest is not None:
             ctx.watermark_digests[request_key] = new_digest
+            logger.debug("%s: pagination complete, watermark_digest=%s", request_key, new_digest)
 
     def _resolve_date_from(self, *, date_to: date) -> date:
         """
