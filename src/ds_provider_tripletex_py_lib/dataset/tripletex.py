@@ -161,15 +161,15 @@ class _ReadContext:
     """
     Mutable, per-call state threaded through one ``read()`` call's pagination.
 
-    ``digest_watermarks``/``changed_since_watermarks``/``resume_offsets``/``resume_digests``/
+    ``watermark_digests``/``watermark_changed_since``/``resume_offsets``/``resume_digests``/
     ``records`` are local, mutable copies the readers write into --
     ``self.checkpoint``/``self.output`` aren't updated until the reader returns.
     """
 
     url: str
     fields_param: str
-    digest_watermarks: dict[str, str]
-    changed_since_watermarks: dict[str, str]
+    watermark_digests: dict[str, str]
+    watermark_changed_since: dict[str, str]
     resume_offsets: dict[str, int]
     resume_digests: dict[str, str]
     records: list[dict[str, Any]]
@@ -211,7 +211,7 @@ class TripletexDataset(
         """
         Whether this dataset supports incremental loads via ``self.checkpoint``.
 
-        Checkpoint holds ``{"digest_watermarks": {...}, "changed_since_watermarks": {...},
+        Checkpoint holds ``{"watermark_digests": {...}, "watermark_changed_since": {...},
         "resume_offsets": {...}, "resume_digests": {...}}`` -- stored
         digest/changed_since_watermark values per request, plus (digest-cached products
         only) a resumable ``from`` offset and its digest, left behind by a
@@ -448,9 +448,9 @@ class TripletexDataset(
             ConnectionError: If the transport cannot reach Tripletex.
             ReadError: If the read fails for any other reason.
         """
-        init_digest_watermarks: dict[str, str] = dict(self.checkpoint.get("digest_watermarks", {})) if self.checkpoint else {}
-        init_changed_since_watermarks: dict[str, str] = (
-            dict(self.checkpoint.get("changed_since_watermarks", {})) if self.checkpoint else {}
+        init_watermark_digests: dict[str, str] = dict(self.checkpoint.get("watermark_digests", {})) if self.checkpoint else {}
+        init_watermark_changed_since: dict[str, str] = (
+            dict(self.checkpoint.get("watermark_changed_since", {})) if self.checkpoint else {}
         )
         init_resume_offsets: dict[str, int] = dict(self.checkpoint.get("resume_offsets", {})) if self.checkpoint else {}
         init_resume_digests: dict[str, str] = dict(self.checkpoint.get("resume_digests", {})) if self.checkpoint else {}
@@ -458,8 +458,8 @@ class TripletexDataset(
         ctx = _ReadContext(
             url=f"{self.linked_service.settings.host}/{read_info.path}",
             fields_param=fields_param,
-            digest_watermarks=dict(init_digest_watermarks),
-            changed_since_watermarks=dict(init_changed_since_watermarks),
+            watermark_digests=dict(init_watermark_digests),
+            watermark_changed_since=dict(init_watermark_changed_since),
             resume_offsets=dict(init_resume_offsets),
             resume_digests=dict(init_resume_digests),
             records=records,
@@ -474,16 +474,16 @@ class TripletexDataset(
             # them and reclassify them as ReadError. Re-raising here lets them
             # propagate as themselves instead.
             self.checkpoint = {
-                "digest_watermarks": init_digest_watermarks,
-                "changed_since_watermarks": init_changed_since_watermarks,
+                "watermark_digests": init_watermark_digests,
+                "watermark_changed_since": init_watermark_changed_since,
                 "resume_offsets": ctx.resume_offsets,
                 "resume_digests": ctx.resume_digests,
             }
             raise
         except ResourceException as exc:
             self.checkpoint = {
-                "digest_watermarks": init_digest_watermarks,
-                "changed_since_watermarks": init_changed_since_watermarks,
+                "watermark_digests": init_watermark_digests,
+                "watermark_changed_since": init_watermark_changed_since,
                 "resume_offsets": ctx.resume_offsets,
                 "resume_digests": ctx.resume_digests,
             }
@@ -501,8 +501,8 @@ class TripletexDataset(
             self.output = output
 
         self.checkpoint = {
-            "digest_watermarks": ctx.digest_watermarks,
-            "changed_since_watermarks": ctx.changed_since_watermarks,
+            "watermark_digests": ctx.watermark_digests,
+            "watermark_changed_since": ctx.watermark_changed_since,
             "resume_offsets": {},
             "resume_digests": {},
         }
@@ -514,7 +514,7 @@ class TripletexDataset(
         Tripletex's ``changedSince`` param (format ``YYYY-MM-DDThh:mm:ssZ``)
         filters server-side to only rows changed since that timestamp. The
         next run's changed_since_watermark is captured as this run's start time and only
-        stored in ``ctx.changed_since_watermarks`` once every page succeeds.
+        stored in ``ctx.watermark_changed_since`` once every page succeeds.
 
         Always starts at ``offset=0`` -- not resumable. ``changedSince``
         filters a mutable, moving result set, so a stored offset can't be
@@ -523,7 +523,7 @@ class TripletexDataset(
         """
         extra_params = self.settings.read.params
         request_key = _request_key(ctx.fields_param, extra_params=extra_params)
-        changed_since_value = ctx.changed_since_watermarks.get(request_key)
+        changed_since_value = ctx.watermark_changed_since.get(request_key)
         run_started_at = datetime.now(tz=timezone.utc)
         count = self.settings.read.count
         offset = 0
@@ -542,7 +542,7 @@ class TripletexDataset(
 
             ctx.records.extend(values)
             offset += len(values)
-        ctx.changed_since_watermarks[request_key] = run_started_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+        ctx.watermark_changed_since[request_key] = run_started_at.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def _read_paginated_by_digest(self, ctx: _ReadContext) -> None:
         """
@@ -576,12 +576,12 @@ class TripletexDataset(
 
         Args:
             ctx: Read context to append ``records`` into and cache
-                ``digest_watermarks``/``resume_offsets``/``resume_digests`` on.
+                ``watermark_digests``/``resume_offsets``/``resume_digests`` on.
             request_key: Cache key identifying this request shape.
             extra_query_params: Extra query params beyond ``from``/``count``/``fields``.
         """
         extra_params = self.settings.read.params
-        if_none_match = ctx.digest_watermarks.get(request_key, "magic-value")
+        if_none_match = ctx.watermark_digests.get(request_key, "magic-value")
         count = self.settings.read.count
         offset = ctx.resume_offsets.get(request_key, 0)
         expected_resume_digest = ctx.resume_digests.get(request_key)
@@ -624,7 +624,7 @@ class TripletexDataset(
         ctx.resume_offsets.pop(request_key, None)
         ctx.resume_digests.pop(request_key, None)
         if new_digest is not None:
-            ctx.digest_watermarks[request_key] = new_digest
+            ctx.watermark_digests[request_key] = new_digest
 
     def _resolve_date_from(self, *, date_to: date) -> date:
         """
@@ -662,7 +662,7 @@ class TripletexDataset(
 
         Tripletex requires a bounded ``dateFrom``/``dateTo`` per request, so
         this walks the read window in monthly steps, offset-paginating and
-        digest-caching within each. ``ctx.changed_since_watermarks`` is never touched here
+        digest-caching within each. ``ctx.watermark_changed_since`` is never touched here
         -- but ``ctx`` is still accepted so the calling convention matches
         ``_resolve_reader``'s other two readers.
 

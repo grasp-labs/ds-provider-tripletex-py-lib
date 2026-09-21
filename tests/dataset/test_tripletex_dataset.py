@@ -291,7 +291,7 @@ def test_read_does_not_advance_checkpoint_when_post_processing_fails():
         ),
         FakeResponse({"values": []}),
     ]
-    prior_checkpoint = {"digest_watermarks": {}, "changed_since_watermarks": {}, "resume_offsets": {}}
+    prior_checkpoint = {"watermark_digests": {}, "watermark_changed_since": {}, "resume_offsets": {}}
     dataset = make_dataset(
         responses,
         product_name=TripletexProductName.SUPPLIER_BANK_ACCOUNTS_LITE,
@@ -561,7 +561,7 @@ def test_incremental_load_sends_stored_digest():
     fields_param = _build_fields_param(department_info.fields)
     key = _request_key(fields_param)
     responses = [FakeResponse({"values": [], "versionDigest": "d2"}, status_code=304)]
-    dataset = make_dataset(responses, product_name=TripletexProductName.DEPARTMENT, checkpoint={"digest_watermarks": {key: "d1"}})
+    dataset = make_dataset(responses, product_name=TripletexProductName.DEPARTMENT, checkpoint={"watermark_digests": {key: "d1"}})
     dataset.read()
     assert dataset.linked_service.connection.requests[0]["headers"]["If-None-Match"] == "d1"
 
@@ -569,7 +569,7 @@ def test_incremental_load_sends_stored_digest():
 def test_304_short_circuits_without_further_pages():
     """A 304 response stops pagination immediately with no further requests."""
     responses = [FakeResponse({}, status_code=304)]
-    dataset = make_dataset(responses, product_name=TripletexProductName.DEPARTMENT, checkpoint={"digest_watermarks": {}})
+    dataset = make_dataset(responses, product_name=TripletexProductName.DEPARTMENT, checkpoint={"watermark_digests": {}})
     dataset.read()
     assert dataset.output.empty
     assert len(dataset.linked_service.connection.requests) == 1
@@ -583,19 +583,19 @@ def test_checkpoint_updated_after_successful_read():
     ]
     dataset = make_dataset(responses, product_name=TripletexProductName.DEPARTMENT, checkpoint={})
     dataset.read()
-    assert "new-digest" in dataset.checkpoint["digest_watermarks"].values()
+    assert "new-digest" in dataset.checkpoint["watermark_digests"].values()
 
 
-def test_checkpoint_preserves_other_products_digest_watermarks():
-    """Existing digest_watermarks for other request keys are preserved across a read()."""
+def test_checkpoint_preserves_other_products_watermark_digests():
+    """Existing watermark_digests for other request keys are preserved across a read()."""
     responses = [FakeResponse({"values": [], "versionDigest": "d1"})]
     dataset = make_dataset(
         responses,
         product_name=TripletexProductName.DEPARTMENT,
-        checkpoint={"digest_watermarks": {"unrelated-key": "unrelated-digest"}},
+        checkpoint={"watermark_digests": {"unrelated-key": "unrelated-digest"}},
     )
     dataset.read()
-    assert dataset.checkpoint["digest_watermarks"]["unrelated-key"] == "unrelated-digest"
+    assert dataset.checkpoint["watermark_digests"]["unrelated-key"] == "unrelated-digest"
 
 
 # -----------------------------------------------------------------------------
@@ -636,7 +636,7 @@ def test_changed_since_product_sends_stored_changed_since_watermark():
     dataset = make_dataset(
         responses,
         product_name=TripletexProductName.CUSTOMER,
-        checkpoint={"changed_since_watermarks": {key: "2024-01-01T00:00:00Z"}},
+        checkpoint={"watermark_changed_since": {key: "2024-01-01T00:00:00Z"}},
     )
     dataset.read()
     assert dataset.linked_service.connection.requests[0]["params"]["changedSince"] == "2024-01-01T00:00:00Z"
@@ -647,7 +647,7 @@ def test_changed_since_product_stores_new_changed_since_watermark_after_success(
     responses = [FakeResponse({"values": [], "versionDigest": "irrelevant"})]
     dataset = make_dataset(responses, product_name=TripletexProductName.CUSTOMER, checkpoint={})
     dataset.read()
-    (stored_changed_since_watermark,) = dataset.checkpoint["changed_since_watermarks"].values()
+    (stored_changed_since_watermark,) = dataset.checkpoint["watermark_changed_since"].values()
     datetime.strptime(stored_changed_since_watermark, "%Y-%m-%dT%H:%M:%SZ")  # raises ValueError if malformed
 
 
@@ -678,7 +678,7 @@ def test_changed_since_pagination_raises_when_params_sets_reserved_key():
 def test_changed_since_product_does_not_advance_changed_since_watermark_on_mid_pagination_failure():
     """A changed_since_watermark captured this run must not be persisted if a later page fails.
 
-    digest_watermarks/changed_since_watermarks stay byte-identical to what they were before the
+    watermark_digests/watermark_changed_since stay byte-identical to what they were before the
     call, per contract. resume_offsets stays empty too -- changedSince
     pagination is deliberately not resumable (a stored offset isn't a safe
     resume point for a moving, changedSince-filtered result set), so the
@@ -688,7 +688,7 @@ def test_changed_since_product_does_not_advance_changed_since_watermark_on_mid_p
         FakeResponse({"values": [{"id": 1}], "versionDigest": "irrelevant"}),
         ResourceException(message="unexpected failure"),
     ]
-    prior_checkpoint = {"digest_watermarks": {}, "changed_since_watermarks": {"stale": "2020-01-01T00:00:00Z"}}
+    prior_checkpoint = {"watermark_digests": {}, "watermark_changed_since": {"stale": "2020-01-01T00:00:00Z"}}
     dataset = make_dataset(
         responses,
         product_name=TripletexProductName.CUSTOMER,
@@ -697,8 +697,8 @@ def test_changed_since_product_does_not_advance_changed_since_watermark_on_mid_p
     )
     with pytest.raises(ReadError):
         dataset.read()
-    assert dataset.checkpoint["digest_watermarks"] == prior_checkpoint["digest_watermarks"]
-    assert dataset.checkpoint["changed_since_watermarks"] == prior_checkpoint["changed_since_watermarks"]
+    assert dataset.checkpoint["watermark_digests"] == prior_checkpoint["watermark_digests"]
+    assert dataset.checkpoint["watermark_changed_since"] == prior_checkpoint["watermark_changed_since"]
     assert dataset.checkpoint["resume_offsets"] == {}
 
 
@@ -763,14 +763,14 @@ def test_read_does_not_advance_digest_on_mid_pagination_failure():
 
     Otherwise the next run would see that digest as already-current (a 304) and
     skip re-fetching data this run never actually finished retrieving.
-    digest_watermarks/changed_since_watermarks stay byte-identical to what they were before the
+    watermark_digests/watermark_changed_since stay byte-identical to what they were before the
     call, per contract -- pagination separately records the resume offset.
     """
     responses = [
         FakeResponse({"values": [{"id": 1}], "versionDigest": "d1"}),
         ResourceException(message="unexpected failure"),
     ]
-    prior_checkpoint = {"digest_watermarks": {"stale": "old-digest"}, "changed_since_watermarks": {}}
+    prior_checkpoint = {"watermark_digests": {"stale": "old-digest"}, "watermark_changed_since": {}}
     dataset = make_dataset(
         responses,
         product_name=TripletexProductName.DEPARTMENT,
@@ -779,8 +779,8 @@ def test_read_does_not_advance_digest_on_mid_pagination_failure():
     )
     with pytest.raises(ReadError):
         dataset.read()
-    assert dataset.checkpoint["digest_watermarks"] == prior_checkpoint["digest_watermarks"]
-    assert dataset.checkpoint["changed_since_watermarks"] == prior_checkpoint["changed_since_watermarks"]
+    assert dataset.checkpoint["watermark_digests"] == prior_checkpoint["watermark_digests"]
+    assert dataset.checkpoint["watermark_changed_since"] == prior_checkpoint["watermark_changed_since"]
     (resume_offset,) = dataset.checkpoint["resume_offsets"].values()
     assert resume_offset == 1
     (resume_digest,) = dataset.checkpoint["resume_digests"].values()
@@ -798,8 +798,8 @@ def test_read_resumes_digest_pagination_from_stored_offset():
     key = _request_key(fields_param)
     responses = [FakeResponse({"values": [{"id": 3}], "versionDigest": "d1"}), FakeResponse({"values": []})]
     prior_checkpoint = {
-        "digest_watermarks": {},
-        "changed_since_watermarks": {},
+        "watermark_digests": {},
+        "watermark_changed_since": {},
         "resume_offsets": {key: 2},
         "resume_digests": {key: "d1"},
     }
@@ -833,8 +833,8 @@ def test_read_restarts_digest_pagination_when_resume_digest_does_not_match():
         FakeResponse({"values": []}),
     ]
     prior_checkpoint = {
-        "digest_watermarks": {},
-        "changed_since_watermarks": {},
+        "watermark_digests": {},
+        "watermark_changed_since": {},
         "resume_offsets": {key: 2},
         "resume_digests": {key: "d1"},
     }
@@ -863,7 +863,7 @@ def test_changed_since_pagination_ignores_stored_offset_and_starts_at_zero():
     fields_param = _build_fields_param(customer_info.fields)
     key = _request_key(fields_param)
     responses = [FakeResponse({"values": [{"id": 3}]}), FakeResponse({"values": []})]
-    prior_checkpoint = {"digest_watermarks": {}, "changed_since_watermarks": {}, "resume_offsets": {key: 2}}
+    prior_checkpoint = {"watermark_digests": {}, "watermark_changed_since": {}, "resume_offsets": {key: 2}}
     dataset = make_dataset(
         responses,
         product_name=TripletexProductName.CUSTOMER,
@@ -878,7 +878,7 @@ def test_changed_since_pagination_ignores_stored_offset_and_starts_at_zero():
 def test_read_clears_pagination_on_full_success():
     """A prior resume position is dropped once its pass completes successfully."""
     responses = [FakeResponse({"values": [], "versionDigest": "d1"})]
-    prior_checkpoint = {"digest_watermarks": {}, "changed_since_watermarks": {}, "resume_offsets": {"some-other-key": 5}}
+    prior_checkpoint = {"watermark_digests": {}, "watermark_changed_since": {}, "resume_offsets": {"some-other-key": 5}}
     dataset = make_dataset(responses, product_name=TripletexProductName.DEPARTMENT, checkpoint=prior_checkpoint)
     dataset.read()
     assert dataset.checkpoint["resume_offsets"] == {}
@@ -889,7 +889,7 @@ def test_read_falls_back_to_magic_value_when_version_digest_is_null():
     responses = [FakeResponse({"values": [], "versionDigest": None})]
     dataset = make_dataset(responses, product_name=TripletexProductName.DEPARTMENT)
     dataset.read()
-    (stored_digest,) = dataset.checkpoint["digest_watermarks"].values()
+    (stored_digest,) = dataset.checkpoint["watermark_digests"].values()
     assert stored_digest == "magic-value"
 
 
@@ -1031,7 +1031,7 @@ def test_read_custom_path_supports_changed_since():
             pagination=PaginationKind.OFFSET,
             changed_since=True,
         ),
-        checkpoint={"changed_since_watermarks": {key: "2024-01-01T00:00:00Z"}},
+        checkpoint={"watermark_changed_since": {key: "2024-01-01T00:00:00Z"}},
     )
     dataset.read()
     request = dataset.linked_service.connection.requests[0]
@@ -1121,7 +1121,7 @@ def test_date_windowed_product_304_short_circuits_a_window(monkeypatch):
     dataset = make_dataset(
         responses,
         product_name=TripletexProductName.LEDGER_POSTING,
-        checkpoint={"digest_watermarks": {}},
+        checkpoint={"watermark_digests": {}},
     )
     dataset.read()
 
@@ -1143,7 +1143,7 @@ def test_date_windowed_product_does_not_advance_digest_of_completed_period_on_la
         FakeResponse({"values": [], "versionDigest": "new-digest"}),
         ResourceException(message="unexpected failure"),
     ]
-    prior_checkpoint = {"digest_watermarks": {}, "changed_since_watermarks": {}}
+    prior_checkpoint = {"watermark_digests": {}, "watermark_changed_since": {}}
     dataset = make_dataset(
         responses,
         product_name=TripletexProductName.LEDGER_POSTING,
@@ -1152,7 +1152,7 @@ def test_date_windowed_product_does_not_advance_digest_of_completed_period_on_la
     with pytest.raises(ReadError):
         dataset.read()
 
-    assert dataset.checkpoint["digest_watermarks"] == prior_checkpoint["digest_watermarks"]
+    assert dataset.checkpoint["watermark_digests"] == prior_checkpoint["watermark_digests"]
 
 
 def test_date_windowed_product_uses_url_from_endpoint_path(monkeypatch):
