@@ -163,21 +163,22 @@ def process_data(data: list[str], threshold: float = 0.5) -> dict[str, int]:
 
 ```python
 """
-File: test_example.py
-Description: Tests for example module
+File: test_read_info.py
+Description: Tests for read_info module
 """
 
 import pytest
-from ds_provider_tripletex_py_lib.example import example_function
+from ds_provider_tripletex_py_lib.enums import TripletexProductName
+from ds_provider_tripletex_py_lib.read_info import get_read_info
 
 
-def test_example_function_basic() -> None:
-    """Test basic functionality of example_function."""
-    result = example_function(1, "test")
-    assert result is True
+def test_get_read_info_returns_packaged_path() -> None:
+    """Test basic functionality of get_read_info."""
+    result = get_read_info(TripletexProductName.CUSTOMER)
+    assert result.path == "customer"
 
 
-def test_example_function_edge_cases() -> None:
+def test_get_read_info_edge_cases() -> None:
     """Test edge cases."""
     # Test implementation
 ```

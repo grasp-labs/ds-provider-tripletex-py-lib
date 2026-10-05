@@ -270,6 +270,40 @@ def test_read_explode_raises_read_error_when_value_is_not_a_list():
         dataset.read()
 
 
+def test_read_does_not_advance_checkpoint_when_post_processing_fails():
+    """A malformed response that fails _explode_column must not commit a new checkpoint.
+
+    The reader itself succeeds (fetches every page, gets a real versionDigest) --
+    it's the *later* deserialize/explode step, in `finally`, that raises. If the
+    checkpoint were committed in an `else` clause (which runs before `finally`),
+    the new digest would already be persisted despite read() ultimately failing,
+    so a later run would see it as already-current and skip data that never
+    produced a valid output.
+    """
+    responses = [
+        FakeResponse(
+            {
+                "values": [
+                    {"id": 1, "isInactive": False, "bankAccountPresentation": 0},
+                ],
+                "versionDigest": "brand-new-digest",
+            }
+        ),
+        FakeResponse({"values": []}),
+    ]
+    prior_checkpoint = {"watermark_digests": {}, "watermark_changed_since": {}, "resume_offsets": {}}
+    dataset = make_dataset(
+        responses,
+        product_name=TripletexProductName.SUPPLIER_BANK_ACCOUNTS_LITE,
+        checkpoint=dict(prior_checkpoint),
+    )
+
+    with pytest.raises(ReadError, match="bankAccountPresentation"):
+        dataset.read()
+
+    assert dataset.checkpoint == prior_checkpoint
+
+
 def test_read_explode_raises_read_error_when_value_is_a_string_not_a_list():
     responses = [
         FakeResponse(
@@ -460,6 +494,217 @@ def test_read_merges_extra_params():
     assert dataset.linked_service.connection.requests[0]["params"]["foo"] == "bar"
 
 
+def test_digest_pagination_raises_when_params_sets_reserved_key():
+    """settings.read.params can't set from/count/fields -- must raise, not silently collide.
+
+    Caught upfront by _validate_read_settings, before any request is made --
+    a stray "from" would otherwise pin every request to a fixed offset,
+    refetching the same page forever.
+    """
+    dataset = make_dataset(
+        [],
+        product_name=TripletexProductName.DEPARTMENT,
+        read=TripletexReadSettings(count=1, params={"from": 0, "count": 999, "fields": "bogus"}),
+    )
+    with pytest.raises(ReadError, match="from"):
+        dataset.read()
+    assert len(dataset.linked_service.connection.requests) == 0
+
+
+def test_digest_pagination_raises_when_params_sets_sorting():
+    """settings.read.params can't set sorting either -- this module pins sorting=id itself."""
+    dataset = make_dataset(
+        [],
+        product_name=TripletexProductName.DEPARTMENT,
+        read=TripletexReadSettings(count=1, params={"sorting": "name"}),
+    )
+    with pytest.raises(ReadError, match="sorting"):
+        dataset.read()
+    assert len(dataset.linked_service.connection.requests) == 0
+
+
+def test_digest_pagination_sends_sorting_id_on_every_request():
+    """Every digest-paginated request explicitly pins sorting=id.
+
+    Confirmed live: this matches Tripletex's own default order, and makes
+    it explicit/guaranteed rather than relying on an undocumented default --
+    new rows (server-assigned, increasing IDs) then always append after
+    what's already been seen, never shifting earlier offsets.
+    """
+    responses = [
+        FakeResponse({"values": [{"id": 1}], "versionDigest": "d1"}),
+        FakeResponse({"values": []}),
+    ]
+    dataset = make_dataset(responses, product_name=TripletexProductName.DEPARTMENT, read=TripletexReadSettings(count=1))
+    dataset.read()
+    requests = dataset.linked_service.connection.requests
+    assert len(requests) == 2
+    assert all(r["params"]["sorting"] == "id" for r in requests)
+
+
+def test_read_raises_when_no_stable_sort_field_can_be_resolved():
+    """A product with no top-level id and no stable_sort_field override raises ReadError.
+
+    Resumable pagination can't guarantee row order without a stable,
+    server-assigned, monotonic field to sort by -- silently omitting
+    sorting would risk a skip or duplicate on resume.
+    """
+    dataset = make_dataset(
+        [],
+        product_name=None,
+        read=TripletexReadSettings(
+            count=1, path="balanceSheet", fields=["account"], pagination=PaginationKind.OFFSET, changed_since=False
+        ),
+    )
+    with pytest.raises(ReadError, match="stable_sort_field"):
+        dataset.read()
+
+
+def test_digest_pagination_sends_stable_sort_field_override():
+    """settings.read.stable_sort_field is sent as sorting when the product has no top-level id."""
+    responses = [
+        FakeResponse({"values": [{"account": {"id": 1}}], "versionDigest": "d1"}),
+        FakeResponse({"values": []}),
+    ]
+    dataset = make_dataset(
+        responses,
+        product_name=None,
+        read=TripletexReadSettings(
+            count=1,
+            path="balanceSheet",
+            fields=["account"],
+            pagination=PaginationKind.OFFSET,
+            changed_since=False,
+            stable_sort_field="account.id",
+        ),
+    )
+    dataset.read()
+    requests = dataset.linked_service.connection.requests
+    assert len(requests) == 2
+    assert all(r["params"]["sorting"] == "account.id" for r in requests)
+
+
+def test_stable_sort_field_validation_handles_nested_field_selector():
+    """stable_sort_field="account.id" is valid when fields uses the nested-dict form {"account": [...]}.
+
+    fields entries can be a one-key dict expanding a sub-object, not just a
+    bare string -- the root-in-fields check must recognize that shape too,
+    not just literal string membership.
+    """
+    responses = [
+        FakeResponse({"values": [{"account": {"id": 1}}], "versionDigest": "d1"}),
+        FakeResponse({"values": []}),
+    ]
+    dataset = make_dataset(
+        responses,
+        product_name=None,
+        read=TripletexReadSettings(
+            count=1,
+            path="balanceSheet",
+            fields=[{"account": ["id"]}],
+            pagination=PaginationKind.OFFSET,
+            changed_since=False,
+            stable_sort_field="account.id",
+        ),
+    )
+    dataset.read()
+    requests = dataset.linked_service.connection.requests
+    assert len(requests) == 2
+    assert all(r["params"]["sorting"] == "account.id" for r in requests)
+
+
+def test_stable_sort_field_set_alongside_product_name_is_silently_ignored():
+    """settings.read.stable_sort_field alongside product_name has no effect -- the packaged metadata wins."""
+    responses = [FakeResponse({"values": [], "versionDigest": "d1"})]
+    dataset = make_dataset(
+        responses, product_name=TripletexProductName.DEPARTMENT, read=TripletexReadSettings(stable_sort_field="name")
+    )
+    dataset.read()
+    assert dataset.linked_service.connection.requests[0]["params"]["sorting"] == "id"
+
+
+def test_stable_sort_field_defaults_to_id_for_custom_path():
+    """A custom path with no explicit stable_sort_field override defaults to sorting=id."""
+    responses = [FakeResponse({"values": [], "versionDigest": "d1"})]
+    dataset = make_dataset(
+        responses,
+        product_name=None,
+        read=TripletexReadSettings(
+            path="custom/thing", fields=["id", "name"], pagination=PaginationKind.OFFSET, changed_since=False
+        ),
+    )
+    dataset.read()
+    assert dataset.linked_service.connection.requests[0]["params"]["sorting"] == "id"
+
+
+def test_digest_pagination_sends_no_sorting_when_stable_sort_field_is_none():
+    """settings.read.stable_sort_field=None opts out: no sorting is sent, even though fields has no id."""
+    responses = [FakeResponse({"values": [], "versionDigest": "d1"})]
+    dataset = make_dataset(
+        responses,
+        product_name=None,
+        read=TripletexReadSettings(
+            path="balanceSheet",
+            fields=["account"],
+            pagination=PaginationKind.OFFSET,
+            changed_since=False,
+            stable_sort_field=None,
+        ),
+    )
+    dataset.read()
+    assert "sorting" not in dataset.linked_service.connection.requests[0]["params"]
+
+
+def test_digest_pagination_sends_no_sorting_when_stable_sort_field_is_empty_string():
+    """settings.read.stable_sort_field="" opts out the same way as None."""
+    responses = [FakeResponse({"values": [], "versionDigest": "d1"})]
+    dataset = make_dataset(
+        responses,
+        product_name=None,
+        read=TripletexReadSettings(
+            path="balanceSheet",
+            fields=["account"],
+            pagination=PaginationKind.OFFSET,
+            changed_since=False,
+            stable_sort_field="",
+        ),
+    )
+    dataset.read()
+    assert "sorting" not in dataset.linked_service.connection.requests[0]["params"]
+
+
+def test_changed_since_pagination_sends_no_sorting_when_stable_sort_field_is_none():
+    """changedSince pagination also honors the stable_sort_field=None opt-out."""
+    responses = [FakeResponse({"values": [], "versionDigest": "irrelevant"})]
+    dataset = make_dataset(
+        responses,
+        product_name=None,
+        read=TripletexReadSettings(
+            path="custom/thing",
+            fields=["name"],
+            pagination=PaginationKind.OFFSET,
+            changed_since=True,
+            stable_sort_field=None,
+        ),
+        checkpoint={},
+    )
+    dataset.read()
+    assert "sorting" not in dataset.linked_service.connection.requests[0]["params"]
+
+
+def test_balance_sheet_packaged_product_sends_account_id_as_sorting(monkeypatch):
+    """The packaged balance_sheet product resolves stable_sort_field from its own metadata (account.id)."""
+    monkeypatch.setattr(tripletex_mod, "_period_generator", lambda **kwargs: iter([(date(2024, 1, 1), date(2024, 2, 1))]))
+    responses = [
+        FakeResponse({"values": [{"account": {"id": 1}}], "versionDigest": None}),
+        FakeResponse({"values": []}),
+    ]
+    dataset = make_dataset(responses, product_name=TripletexProductName.BALANCE_SHEET)
+    dataset.read()
+    requests = dataset.linked_service.connection.requests
+    assert all(r["params"]["sorting"] == "account.id" for r in requests)
+
+
 # -----------------------------------------------------------------------------
 # Contract: checkpoint (conditional GET via versionDigest)
 # -----------------------------------------------------------------------------
@@ -477,9 +722,9 @@ def test_incremental_load_sends_stored_digest():
     """A populated checkpoint sends the previously stored versionDigest as If-None-Match."""
     department_info = get_read_info(TripletexProductName.DEPARTMENT)
     fields_param = _build_fields_param(department_info.fields)
-    key = _request_key(fields_param)
+    key = _request_key(fields_param, stable_sort_field="id")
     responses = [FakeResponse({"values": [], "versionDigest": "d2"}, status_code=304)]
-    dataset = make_dataset(responses, product_name=TripletexProductName.DEPARTMENT, checkpoint={"checksums": {key: "d1"}})
+    dataset = make_dataset(responses, product_name=TripletexProductName.DEPARTMENT, checkpoint={"watermark_digests": {key: "d1"}})
     dataset.read()
     assert dataset.linked_service.connection.requests[0]["headers"]["If-None-Match"] == "d1"
 
@@ -487,7 +732,7 @@ def test_incremental_load_sends_stored_digest():
 def test_304_short_circuits_without_further_pages():
     """A 304 response stops pagination immediately with no further requests."""
     responses = [FakeResponse({}, status_code=304)]
-    dataset = make_dataset(responses, product_name=TripletexProductName.DEPARTMENT, checkpoint={"checksums": {}})
+    dataset = make_dataset(responses, product_name=TripletexProductName.DEPARTMENT, checkpoint={"watermark_digests": {}})
     dataset.read()
     assert dataset.output.empty
     assert len(dataset.linked_service.connection.requests) == 1
@@ -501,19 +746,19 @@ def test_checkpoint_updated_after_successful_read():
     ]
     dataset = make_dataset(responses, product_name=TripletexProductName.DEPARTMENT, checkpoint={})
     dataset.read()
-    assert "new-digest" in dataset.checkpoint["checksums"].values()
+    assert "new-digest" in dataset.checkpoint["watermark_digests"].values()
 
 
-def test_checkpoint_preserves_other_products_checksums():
-    """Existing checksums for other request keys are preserved across a read()."""
+def test_checkpoint_preserves_other_products_watermark_digests():
+    """Existing watermark_digests for other request keys are preserved across a read()."""
     responses = [FakeResponse({"values": [], "versionDigest": "d1"})]
     dataset = make_dataset(
         responses,
         product_name=TripletexProductName.DEPARTMENT,
-        checkpoint={"checksums": {"unrelated-key": "unrelated-digest"}},
+        checkpoint={"watermark_digests": {"unrelated-key": "unrelated-digest"}},
     )
     dataset.read()
-    assert dataset.checkpoint["checksums"]["unrelated-key"] == "unrelated-digest"
+    assert dataset.checkpoint["watermark_digests"]["unrelated-key"] == "unrelated-digest"
 
 
 # -----------------------------------------------------------------------------
@@ -522,7 +767,7 @@ def test_checkpoint_preserves_other_products_checksums():
 
 
 def test_changed_since_product_sends_no_filter_on_first_run():
-    """A changedSince-capable product with no stored watermark reads everything, unfiltered."""
+    """A changedSince-capable product with no stored changed_since_watermark reads everything, unfiltered."""
     responses = [FakeResponse({"values": [], "versionDigest": "irrelevant"})]
     dataset = make_dataset(responses, product_name=TripletexProductName.CUSTOMER, checkpoint={})
     dataset.read()
@@ -531,27 +776,81 @@ def test_changed_since_product_sends_no_filter_on_first_run():
     assert request["headers"] is None
 
 
-def test_changed_since_product_sends_stored_watermark():
-    """A changedSince-capable product with a stored watermark sends it as the changedSince filter."""
+def test_changed_since_pagination_sends_sorting_id_on_every_request():
+    """changedSince pagination pins sorting=id too, so a row changed mid-run can't shift pages."""
+    responses = [
+        FakeResponse({"values": [{"id": 1}], "versionDigest": "irrelevant"}),
+        FakeResponse({"values": []}),
+    ]
+    dataset = make_dataset(
+        responses, product_name=TripletexProductName.CUSTOMER, read=TripletexReadSettings(count=1), checkpoint={}
+    )
+    dataset.read()
+    requests = dataset.linked_service.connection.requests
+    assert len(requests) == 2
+    assert all(r["params"]["sorting"] == "id" for r in requests)
+
+
+def test_changed_since_pagination_raises_when_no_stable_sort_field_can_be_resolved():
+    """A changedSince-capable custom path with no top-level id and no override raises ReadError."""
+    dataset = make_dataset(
+        [],
+        product_name=None,
+        read=TripletexReadSettings(
+            count=1, path="custom/thing", fields=["name"], pagination=PaginationKind.OFFSET, changed_since=True
+        ),
+        checkpoint={},
+    )
+    with pytest.raises(ReadError, match="stable_sort_field"):
+        dataset.read()
+
+
+def test_changed_since_pagination_sends_stable_sort_field_override():
+    """settings.read.stable_sort_field is sent as sorting for changedSince pagination too."""
+    responses = [
+        FakeResponse({"values": [{"account": {"id": 1}}], "versionDigest": "irrelevant"}),
+        FakeResponse({"values": []}),
+    ]
+    dataset = make_dataset(
+        responses,
+        product_name=None,
+        read=TripletexReadSettings(
+            count=1,
+            path="custom/thing",
+            fields=["account"],
+            pagination=PaginationKind.OFFSET,
+            changed_since=True,
+            stable_sort_field="account.id",
+        ),
+        checkpoint={},
+    )
+    dataset.read()
+    requests = dataset.linked_service.connection.requests
+    assert len(requests) == 2
+    assert all(r["params"]["sorting"] == "account.id" for r in requests)
+
+
+def test_changed_since_product_sends_stored_changed_since_watermark():
+    """A changedSince-capable product with a stored changed_since_watermark sends it as the changedSince filter."""
     customer_info = get_read_info(TripletexProductName.CUSTOMER)
-    key = _request_key(_build_fields_param(customer_info.fields))
+    key = _request_key(_build_fields_param(customer_info.fields), stable_sort_field="id")
     responses = [FakeResponse({"values": [], "versionDigest": "irrelevant"})]
     dataset = make_dataset(
         responses,
         product_name=TripletexProductName.CUSTOMER,
-        checkpoint={"watermarks": {key: "2024-01-01T00:00:00Z"}},
+        checkpoint={"watermark_changed_since": {key: "2024-01-01T00:00:00Z"}},
     )
     dataset.read()
     assert dataset.linked_service.connection.requests[0]["params"]["changedSince"] == "2024-01-01T00:00:00Z"
 
 
-def test_changed_since_product_stores_new_watermark_after_success():
-    """A successful read stores a new YYYY-MM-DDThh:mm:ssZ watermark for the next run."""
+def test_changed_since_product_stores_new_changed_since_watermark_after_success():
+    """A successful read stores a new YYYY-MM-DDThh:mm:ssZ changed_since_watermark for the next run."""
     responses = [FakeResponse({"values": [], "versionDigest": "irrelevant"})]
     dataset = make_dataset(responses, product_name=TripletexProductName.CUSTOMER, checkpoint={})
     dataset.read()
-    (stored_watermark,) = dataset.checkpoint["watermarks"].values()
-    datetime.strptime(stored_watermark, "%Y-%m-%dT%H:%M:%SZ")  # raises ValueError if malformed
+    (stored_changed_since_watermark,) = dataset.checkpoint["watermark_changed_since"].values()
+    datetime.strptime(stored_changed_since_watermark, "%Y-%m-%dT%H:%M:%SZ")  # raises ValueError if malformed
 
 
 def test_changed_since_product_merges_extra_params():
@@ -566,17 +865,32 @@ def test_changed_since_product_merges_extra_params():
     assert dataset.linked_service.connection.requests[0]["params"]["foo"] == "bar"
 
 
-def test_changed_since_product_does_not_advance_watermark_on_mid_pagination_failure():
-    """A watermark captured this run must not be persisted if a later page fails.
+def test_changed_since_pagination_raises_when_params_sets_reserved_key():
+    """settings.read.params can't set changedSince -- must raise, not silently collide."""
+    dataset = make_dataset(
+        [],
+        product_name=TripletexProductName.CUSTOMER,
+        read=TripletexReadSettings(count=1, params={"changedSince": "garbage"}),
+    )
+    with pytest.raises(ReadError, match="changedSince"):
+        dataset.read()
+    assert len(dataset.linked_service.connection.requests) == 0
 
-    self.checkpoint stays byte-identical to what it was before the call --
-    not just empty -- proving it truly wasn't touched, per contract.
+
+def test_changed_since_product_does_not_advance_changed_since_watermark_on_mid_pagination_failure():
+    """A changed_since_watermark captured this run must not be persisted if a later page fails.
+
+    watermark_digests/watermark_changed_since stay byte-identical to what they were before the
+    call, per contract. resume_offsets stays empty too -- changedSince
+    pagination is deliberately not resumable (a stored offset isn't a safe
+    resume point for a moving, changedSince-filtered result set), so the
+    next run always restarts at offset=0 rather than a stale position.
     """
     responses = [
         FakeResponse({"values": [{"id": 1}], "versionDigest": "irrelevant"}),
         ResourceException(message="unexpected failure"),
     ]
-    prior_checkpoint = {"checksums": {}, "watermarks": {"stale": "2020-01-01T00:00:00Z"}}
+    prior_checkpoint = {"watermark_digests": {}, "watermark_changed_since": {"stale": "2020-01-01T00:00:00Z"}}
     dataset = make_dataset(
         responses,
         product_name=TripletexProductName.CUSTOMER,
@@ -585,7 +899,9 @@ def test_changed_since_product_does_not_advance_watermark_on_mid_pagination_fail
     )
     with pytest.raises(ReadError):
         dataset.read()
-    assert dataset.checkpoint == prior_checkpoint
+    assert dataset.checkpoint["watermark_digests"] == prior_checkpoint["watermark_digests"]
+    assert dataset.checkpoint["watermark_changed_since"] == prior_checkpoint["watermark_changed_since"]
+    assert dataset.checkpoint["resume_offsets"] == {}
 
 
 # -----------------------------------------------------------------------------
@@ -644,19 +960,19 @@ def test_read_partial_results_preserved_on_error():
     assert len(dataset.output) == 1
 
 
-def test_read_does_not_advance_checksum_on_mid_pagination_failure():
+def test_read_does_not_advance_digest_on_mid_pagination_failure():
     """A digest seen on an early page must not be persisted if a later page fails.
 
     Otherwise the next run would see that digest as already-current (a 304) and
     skip re-fetching data this run never actually finished retrieving.
-    self.checkpoint stays byte-identical to what it was before the call --
-    not just empty -- proving it truly wasn't touched, per contract.
+    watermark_digests/watermark_changed_since stay byte-identical to what they were before the
+    call, per contract -- pagination separately records the resume offset.
     """
     responses = [
         FakeResponse({"values": [{"id": 1}], "versionDigest": "d1"}),
         ResourceException(message="unexpected failure"),
     ]
-    prior_checkpoint = {"checksums": {"stale": "old-digest"}, "watermarks": {}}
+    prior_checkpoint = {"watermark_digests": {"stale": "old-digest"}, "watermark_changed_since": {}}
     dataset = make_dataset(
         responses,
         product_name=TripletexProductName.DEPARTMENT,
@@ -665,7 +981,139 @@ def test_read_does_not_advance_checksum_on_mid_pagination_failure():
     )
     with pytest.raises(ReadError):
         dataset.read()
-    assert dataset.checkpoint == prior_checkpoint
+    assert dataset.checkpoint["watermark_digests"] == prior_checkpoint["watermark_digests"]
+    assert dataset.checkpoint["watermark_changed_since"] == prior_checkpoint["watermark_changed_since"]
+    (resume_offset,) = dataset.checkpoint["resume_offsets"].values()
+    assert resume_offset == 1
+    (resume_digest,) = dataset.checkpoint["resume_digests"].values()
+    assert resume_digest == "d1"
+
+
+def test_read_resumes_digest_pagination_from_stored_offset():
+    """A stored offset is used, unmodified, when its paired resume_digest matches the resumed page.
+
+    A match proves nothing changed since the offset was recorded, so it's
+    genuinely safe to continue from there instead of re-paging from 0.
+    """
+    department_info = get_read_info(TripletexProductName.DEPARTMENT)
+    fields_param = _build_fields_param(department_info.fields)
+    key = _request_key(fields_param, stable_sort_field="id")
+    responses = [FakeResponse({"values": [{"id": 3}], "versionDigest": "d1"}), FakeResponse({"values": []})]
+    prior_checkpoint = {
+        "watermark_digests": {},
+        "watermark_changed_since": {},
+        "resume_offsets": {key: 2},
+        "resume_digests": {key: "d1"},
+    }
+    dataset = make_dataset(
+        responses,
+        product_name=TripletexProductName.DEPARTMENT,
+        read=TripletexReadSettings(count=1),
+        checkpoint=prior_checkpoint,
+    )
+    dataset.read()
+    assert [r["params"]["from"] for r in dataset.linked_service.connection.requests] == [2, 3]
+    assert dataset.checkpoint["resume_offsets"] == {}
+    assert dataset.checkpoint["resume_digests"] == {}
+    assert len(dataset.output) == 1
+
+
+def test_read_resuming_sends_unconditional_get_ignoring_stored_watermark_digest():
+    """Resuming never sends the real watermark_digest as If-None-Match, even if one is stored.
+
+    A conditional GET only answers "did the whole collection change since my
+    last full success" -- irrelevant mid-resume, since rows past the stored
+    offset are already known to be unfetched. Trusting a 304 there would
+    bypass the mismatch check and could wrongly treat an unverified,
+    incomplete resume as "done".
+    """
+    department_info = get_read_info(TripletexProductName.DEPARTMENT)
+    fields_param = _build_fields_param(department_info.fields)
+    key = _request_key(fields_param, stable_sort_field="id")
+    responses = [FakeResponse({"values": [{"id": 3}], "versionDigest": "d1"}), FakeResponse({"values": []})]
+    prior_checkpoint = {
+        "watermark_digests": {key: "d1"},
+        "watermark_changed_since": {},
+        "resume_offsets": {key: 2},
+        "resume_digests": {key: "d1"},
+    }
+    dataset = make_dataset(
+        responses,
+        product_name=TripletexProductName.DEPARTMENT,
+        read=TripletexReadSettings(count=1),
+        checkpoint=prior_checkpoint,
+    )
+    dataset.read()
+    assert dataset.linked_service.connection.requests[0]["headers"]["If-None-Match"] == "magic-value"
+    assert len(dataset.output) == 1
+
+
+def test_read_restarts_digest_pagination_when_resume_digest_does_not_match():
+    """A stored offset whose paired digest no longer matches the resumed page is discarded.
+
+    Something changed since that offset was recorded -- rows before it may
+    have shifted too, so it can't be trusted; this key restarts from 0
+    instead, re-fetching everything rather than risking a skip.
+    """
+    department_info = get_read_info(TripletexProductName.DEPARTMENT)
+    fields_param = _build_fields_param(department_info.fields)
+    key = _request_key(fields_param, stable_sort_field="id")
+    responses = [
+        FakeResponse({"values": [{"id": 99}], "versionDigest": "d2"}),  # resumed at from=2 -- digest changed, discarded
+        FakeResponse({"values": [{"id": 1}], "versionDigest": "d2"}),  # restarted at from=0
+        FakeResponse({"values": [{"id": 99}], "versionDigest": "d2"}),
+        FakeResponse({"values": []}),
+    ]
+    prior_checkpoint = {
+        "watermark_digests": {},
+        "watermark_changed_since": {},
+        "resume_offsets": {key: 2},
+        "resume_digests": {key: "d1"},
+    }
+    dataset = make_dataset(
+        responses,
+        product_name=TripletexProductName.DEPARTMENT,
+        read=TripletexReadSettings(count=1),
+        checkpoint=prior_checkpoint,
+    )
+    dataset.read()
+    assert [r["params"]["from"] for r in dataset.linked_service.connection.requests] == [2, 0, 1, 2]
+    assert dataset.checkpoint["resume_offsets"] == {}
+    assert dataset.checkpoint["resume_digests"] == {}
+    assert sorted(dataset.output["id"].tolist()) == [1, 99]
+
+
+def test_changed_since_pagination_ignores_stored_offset_and_starts_at_zero():
+    """A stored resume offset is ignored for changedSince pagination -- always restarts at 0.
+
+    changedSince filters a mutable, moving result set; a stored offset from
+    a prior attempt isn't a safe resume point (see
+    _read_paginated_by_changed_since's docstring), so any leftover
+    resume_offsets entry for this key must not be used.
+    """
+    customer_info = get_read_info(TripletexProductName.CUSTOMER)
+    fields_param = _build_fields_param(customer_info.fields)
+    key = _request_key(fields_param, stable_sort_field="id")
+    responses = [FakeResponse({"values": [{"id": 3}]}), FakeResponse({"values": []})]
+    prior_checkpoint = {"watermark_digests": {}, "watermark_changed_since": {}, "resume_offsets": {key: 2}}
+    dataset = make_dataset(
+        responses,
+        product_name=TripletexProductName.CUSTOMER,
+        read=TripletexReadSettings(count=1),
+        checkpoint=prior_checkpoint,
+    )
+    dataset.read()
+    assert dataset.linked_service.connection.requests[0]["params"]["from"] == 0
+    assert dataset.checkpoint["resume_offsets"] == {}
+
+
+def test_read_clears_pagination_on_full_success():
+    """A prior resume position is dropped once its pass completes successfully."""
+    responses = [FakeResponse({"values": [], "versionDigest": "d1"})]
+    prior_checkpoint = {"watermark_digests": {}, "watermark_changed_since": {}, "resume_offsets": {"some-other-key": 5}}
+    dataset = make_dataset(responses, product_name=TripletexProductName.DEPARTMENT, checkpoint=prior_checkpoint)
+    dataset.read()
+    assert dataset.checkpoint["resume_offsets"] == {}
 
 
 def test_read_falls_back_to_magic_value_when_version_digest_is_null():
@@ -673,8 +1121,27 @@ def test_read_falls_back_to_magic_value_when_version_digest_is_null():
     responses = [FakeResponse({"values": [], "versionDigest": None})]
     dataset = make_dataset(responses, product_name=TripletexProductName.DEPARTMENT)
     dataset.read()
-    (stored_digest,) = dataset.checkpoint["checksums"].values()
+    (stored_digest,) = dataset.checkpoint["watermark_digests"].values()
     assert stored_digest == "magic-value"
+
+
+def test_digest_pagination_does_not_record_resume_state_for_null_version_digest():
+    """A product whose versionDigest is always null never records resume_offsets/resume_digests.
+
+    "magic-value" is a constant sentinel, not a real fingerprint -- if it were
+    recorded and compared on resume, it would always equal itself regardless
+    of what actually changed, making the mismatch check vacuous. Such a key
+    must always restart from offset=0 on retry instead of trusting a stored
+    offset it can't actually verify.
+    """
+    responses = [
+        FakeResponse({"values": [{"id": 1}], "versionDigest": None}),
+        FakeResponse({"values": []}),
+    ]
+    dataset = make_dataset(responses, product_name=TripletexProductName.DEPARTMENT, read=TripletexReadSettings(count=1))
+    dataset.read()
+    assert dataset.checkpoint["resume_offsets"] == {}
+    assert dataset.checkpoint["resume_digests"] == {}
 
 
 def test_read_error_details_include_product_name():
@@ -804,7 +1271,7 @@ def test_read_custom_path_uses_offset_pagination_when_requested():
 def test_read_custom_path_supports_changed_since():
     """A custom read.path can opt into Tripletex's changedSince filter via read.changed_since."""
     responses = [FakeResponse({"values": [], "versionDigest": "irrelevant"})]
-    key = _request_key("id", extra_params=None)
+    key = _request_key("id", stable_sort_field="id", extra_params=None)
     dataset = make_dataset(
         responses,
         product_name=None,
@@ -815,7 +1282,7 @@ def test_read_custom_path_supports_changed_since():
             pagination=PaginationKind.OFFSET,
             changed_since=True,
         ),
-        checkpoint={"watermarks": {key: "2024-01-01T00:00:00Z"}},
+        checkpoint={"watermark_changed_since": {key: "2024-01-01T00:00:00Z"}},
     )
     dataset.read()
     request = dataset.linked_service.connection.requests[0]
@@ -905,12 +1372,38 @@ def test_date_windowed_product_304_short_circuits_a_window(monkeypatch):
     dataset = make_dataset(
         responses,
         product_name=TripletexProductName.LEDGER_POSTING,
-        checkpoint={"checksums": {}},
+        checkpoint={"watermark_digests": {}},
     )
     dataset.read()
 
     assert len(dataset.output) == 1
     assert len(dataset.linked_service.connection.requests) == 3
+
+
+def test_date_windowed_product_does_not_advance_digest_of_completed_period_on_later_period_failure(monkeypatch):
+    """A period that fully completes must not persist its new digest if a later period fails.
+
+    Per the dataset contract, the incremental watermark advances only after
+    the whole read() succeeds end-to-end -- not per period -- so a later
+    period's failure must leave every period's digest_watermark unchanged.
+    """
+    periods = [(date(2024, 1, 1), date(2024, 2, 1)), (date(2024, 2, 1), date(2024, 3, 1))]
+    monkeypatch.setattr(tripletex_mod, "_period_generator", lambda **kwargs: iter(periods))
+
+    responses = [
+        FakeResponse({"values": [], "versionDigest": "new-digest"}),
+        ResourceException(message="unexpected failure"),
+    ]
+    prior_checkpoint = {"watermark_digests": {}, "watermark_changed_since": {}}
+    dataset = make_dataset(
+        responses,
+        product_name=TripletexProductName.LEDGER_POSTING,
+        checkpoint=prior_checkpoint,
+    )
+    with pytest.raises(ReadError):
+        dataset.read()
+
+    assert dataset.checkpoint["watermark_digests"] == prior_checkpoint["watermark_digests"]
 
 
 def test_date_windowed_product_uses_url_from_endpoint_path(monkeypatch):
@@ -933,6 +1426,23 @@ def test_date_windowed_product_merges_extra_params(monkeypatch):
     )
     dataset.read()
     assert dataset.linked_service.connection.requests[0]["params"]["foo"] == "bar"
+
+
+def test_date_windowed_product_raises_when_params_sets_reserved_key():
+    """settings.read.params can't set dateFrom/dateTo -- must raise, not silently collide.
+
+    The TripletexReadSettings.params docstring documents dateFrom/dateTo as
+    "auto-generated per window and would override any values passed here" --
+    in practice this is now caught upfront instead, before any request.
+    """
+    dataset = make_dataset(
+        [],
+        product_name=TripletexProductName.LEDGER_POSTING,
+        read=TripletexReadSettings(count=1, params={"dateFrom": "bogus", "dateTo": "bogus"}),
+    )
+    with pytest.raises(ReadError, match="dateFrom"):
+        dataset.read()
+    assert len(dataset.linked_service.connection.requests) == 0
 
 
 def test_date_windowed_product_date_to_is_exclusive_so_today_is_included(monkeypatch):
@@ -1111,6 +1621,20 @@ def test_request_key_differs_by_extra_params():
     key_a = _request_key("id", extra_params={"isInactive": True})
     key_b = _request_key("id", extra_params={"isInactive": False})
     key_none = _request_key("id")
+    assert len({key_a, key_b, key_none}) == 3
+
+
+def test_request_key_differs_by_stable_sort_field():
+    """_request_key differs when stable_sort_field differs, for otherwise-identical requests.
+
+    A stored resume_offset/resume_digest is only safe under the row order it
+    was captured under -- a digest reflects data content, not sort order, so
+    reusing the same key across two different sort fields could let a resumed
+    request silently trust an offset computed under a different ordering.
+    """
+    key_a = _request_key("id,account", stable_sort_field="id")
+    key_b = _request_key("id,account", stable_sort_field="account.id")
+    key_none = _request_key("id,account")
     assert len({key_a, key_b, key_none}) == 3
 
 

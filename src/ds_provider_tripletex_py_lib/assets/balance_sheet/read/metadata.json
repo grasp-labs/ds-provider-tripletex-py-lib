@@ -3,5 +3,6 @@
   "pagination": "date_window",
   "changed_since": false,
   "_comment": "Unlike ledger_posting, versionDigest is always null for /balanceSheet and If-None-Match is never honored (confirmed live: identical requests keep returning 200, never 304) -- no window here is ever checkpoint-skippable, so every read() call re-fetches every window in full.",
-  "fields": ["account", "balanceIn", "balanceChange", "balanceOut", "startDate", "endDate"]
+  "fields": ["account", "balanceIn", "balanceChange", "balanceOut", "startDate", "endDate"],
+  "stable_sort_field": "account.id"
 }

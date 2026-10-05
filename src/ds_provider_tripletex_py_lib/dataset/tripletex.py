@@ -54,6 +54,12 @@ from ..read_info import ReadInfo, get_read_info
 
 logger = Logger.get_logger(__name__, package=True)
 
+# Every query param name this module ever generates itself -- from/count/fields on
+# every request, changedSince on the changedSince loop, dateFrom/dateTo on date-windowed
+# reads, sorting on digest-paginated reads (see _fetch_pages_by_digest). A caller's
+# settings.read.params must never be able to override any of these.
+_RESERVED_QUERY_PARAMS = frozenset({"from", "count", "fields", "changedSince", "dateFrom", "dateTo", "sorting"})
+
 
 @dataclass(kw_only=True)
 class TripletexReadSettings(Serializable):
@@ -78,9 +84,10 @@ class TripletexReadSettings(Serializable):
     params: dict[str, Any] | None = None
     """Additional query parameters merged into every request (e.g. ``isInactive``).
 
-    Not for ``dateFrom``/``dateTo`` on ``date_window``-paginated products
-    (``ledger_posting``, ``balance_sheet``) -- those are auto-generated per
-    window and would override any values passed here.
+    Not for ``from``/``count``/``fields``/``changedSince``/``dateFrom``/
+    ``dateTo``/``sorting`` -- this module generates all of those itself
+    per request, and setting any of them here raises ``ReadError`` instead
+    of being silently overridden.
     """
 
     path: str | None = None
@@ -125,6 +132,22 @@ class TripletexReadSettings(Serializable):
     from a plain nested object (which flattens in place, no explode needed).
     """
 
+    stable_sort_field: str | None = "id"
+    """The field ``sorting`` pins for pagination stability, e.g. ``"account.id"``.
+
+    Only meaningful with ``path`` -- ignored when ``product_name`` is set
+    (fixed by its own metadata). Defaults to ``"id"``; set to a different
+    field (e.g. a nested id like ``"account.id"``) when the product's own
+    id isn't top-level. Either way, ``read()`` raises ``ReadError`` if that
+    field isn't in ``fields``.
+
+    Set explicitly to ``None`` or ``""`` to deliberately opt out: no
+    ``sorting`` is sent at all, and resumable pagination can no longer
+    guarantee row order is preserved across requests -- a silent skip or
+    duplicate becomes possible. Only do this when you've confirmed the
+    product has no field suitable for this.
+    """
+
 
 @dataclass(kw_only=True)
 class TripletexDatasetSettings(DatasetSettings):
@@ -154,23 +177,19 @@ class _ReadContext:
     """
     Mutable, per-call state threaded through one ``read()`` call's pagination.
 
-    Only holds values that aren't otherwise reachable via ``self`` on
-    ``TripletexDataset``: ``url``/``changed_since`` come from the resolved
-    ``read_info``, a local in ``_execute_read`` rather than stored on the
-    instance; ``checksums``/``watermarks``/``records`` are local, mutable
-    copies the readers write into (``self.checkpoint``/``self.output`` aren't
-    updated until after the reader returns). Everything else the readers
-    need (``self.linked_service.connection``, ``self.settings.read.params``,
-    ``self.settings.read.count``) is read directly via ``self``, same as
-    ``self.settings.read.count`` already is.
+    ``watermark_digests``/``watermark_changed_since``/``resume_offsets``/``resume_digests``/
+    ``records`` are local, mutable copies the readers write into --
+    ``self.checkpoint``/``self.output`` aren't updated until the reader returns.
     """
 
     url: str
     fields_param: str
-    checksums: dict[str, str]
-    watermarks: dict[str, str]
+    stable_sort_field: str | None
+    watermark_digests: dict[str, str]
+    watermark_changed_since: dict[str, str]
+    resume_offsets: dict[str, int]
+    resume_digests: dict[str, str]
     records: list[dict[str, Any]]
-    changed_since: bool
 
 
 @dataclass(kw_only=True)
@@ -209,29 +228,39 @@ class TripletexDataset(
         """
         Whether this dataset supports incremental loads via ``self.checkpoint``.
 
-        Checkpoint holds ``{"checksums": {...}, "watermarks": {...}}`` --
-        stored ``versionDigest``/``changedSince`` values per request. An
-        empty checkpoint (``{}``) means a full load.
+        Checkpoint holds ``{"watermark_digests": {...}, "watermark_changed_since": {...},
+        "resume_offsets": {...}, "resume_digests": {...}}`` -- stored
+        digest/changed_since_watermark values per request, plus (digest-cached products
+        only) a resumable ``from`` offset and its digest, left behind by a
+        failed run. An empty checkpoint (``{}``) means a full load.
 
         Returns:
             bool: Always ``True``.
         """
         return True
 
-    def _resolve_reader(self, pagination: PaginationKind) -> Callable[[_ReadContext], None]:
+    def _resolve_reader(self, read_info: ReadInfo) -> Callable[[_ReadContext], None]:
         """
-        Return the read implementation for the given pagination kind.
+        Return the read implementation for the resolved endpoint.
 
         Args:
-            pagination: The resolved endpoint's pagination kind.
+            read_info: The resolved endpoint to read.
 
         Returns:
             Callable[[_ReadContext], None]: ``_read_date_windowed`` for
-            ``DATE_WINDOW``, otherwise ``_read_paginated``.
+            ``DATE_WINDOW`` pagination; otherwise
+            ``_read_paginated_by_changed_since`` for products supporting
+            Tripletex's ``changedSince`` filter, or ``_read_paginated_by_digest``
+            (``versionDigest``/``If-None-Match``) for every other product.
         """
-        if pagination == PaginationKind.DATE_WINDOW:
+        if read_info.pagination == PaginationKind.DATE_WINDOW:
+            logger.debug("%s: reading via date-windowed digest pagination", read_info.path)
             return self._read_date_windowed
-        return self._read_paginated
+        if read_info.changed_since:
+            logger.debug("%s: reading via changedSince pagination", read_info.path)
+            return self._read_paginated_by_changed_since
+        logger.debug("%s: reading via digest-cached offset pagination", read_info.path)
+        return self._read_paginated_by_digest
 
     def _resolve_product_name(self, product_name: str) -> TripletexProductName:
         """
@@ -342,6 +371,7 @@ class TripletexDataset(
             pagination=self.settings.read.pagination,
             changed_since=self.settings.read.changed_since,
             explode_columns=self.settings.read.explode_columns or [],
+            stable_sort_field=self.settings.read.stable_sort_field,
         )
 
     def _validate_read_settings(self, read_info: ReadInfo) -> None:
@@ -354,9 +384,14 @@ class TripletexDataset(
         Raises:
             ReadError: If any ``read.*`` setting is set alongside
                 ``product_name`` (ignored there), ``read.date_from`` is set
-                but pagination isn't :attr:`PaginationKind.DATE_WINDOW`, or
+                but pagination isn't :attr:`PaginationKind.DATE_WINDOW`,
                 ``changed_since`` is combined with date-windowed pagination
-                (``_read_date_windowed`` never emits ``changedSince``).
+                (``_read_date_windowed`` never emits ``changedSince``),
+                ``read.params`` sets a reserved key (``_RESERVED_QUERY_PARAMS``)
+                that this module generates internally per request, or
+                ``read_info.stable_sort_field``'s top-level field isn't in
+                ``read_info.fields`` -- resumable pagination can't sort by a
+                field that was never requested.
         """
         if self.settings.product_name and (
             self.settings.read.path
@@ -395,6 +430,34 @@ class TripletexDataset(
                 details={"type": self.type.value, "path": read_info.path},
             )
 
+        reserved_params_used = _RESERVED_QUERY_PARAMS & (self.settings.read.params or {}).keys()
+        if reserved_params_used:
+            raise ReadError(
+                message=(
+                    f"settings.read.params must not set {sorted(reserved_params_used)} -- these are "
+                    "generated internally for every request and would be silently overridden if "
+                    "allowed through params. Remove them from settings.read.params."
+                ),
+                details={"type": self.type.value, "reserved_params": sorted(reserved_params_used)},
+            )
+
+        if read_info.stable_sort_field:
+            stable_sort_root = read_info.stable_sort_field.split(".", 1)[0]
+            if stable_sort_root not in _field_root_names(read_info.fields):
+                raise ReadError(
+                    message=(
+                        f"stable_sort_field={read_info.stable_sort_field!r} but {stable_sort_root!r} is not "
+                        "in fields -- resumable pagination can't sort by a field that isn't requested. Add "
+                        "it to fields, point stable_sort_field at a field that is, or leave it falsy (None "
+                        "or '') to opt out of the stability guarantee entirely."
+                    ),
+                    details={
+                        "type": self.type.value,
+                        "path": read_info.path,
+                        "stable_sort_field": read_info.stable_sort_field,
+                    },
+                )
+
     def read(self) -> None:
         """
         Read all rows for the configured product and assign them to ``self.output``.
@@ -426,19 +489,25 @@ class TripletexDataset(
             ConnectionError: If the transport cannot reach Tripletex.
             ReadError: If the read fails for any other reason.
         """
-        checksums: dict[str, str] = dict(self.checkpoint.get("checksums", {})) if self.checkpoint else {}
-        watermarks: dict[str, str] = dict(self.checkpoint.get("watermarks", {})) if self.checkpoint else {}
+        init_watermark_digests: dict[str, str] = dict(self.checkpoint.get("watermark_digests", {})) if self.checkpoint else {}
+        init_watermark_changed_since: dict[str, str] = (
+            dict(self.checkpoint.get("watermark_changed_since", {})) if self.checkpoint else {}
+        )
+        init_resume_offsets: dict[str, int] = dict(self.checkpoint.get("resume_offsets", {})) if self.checkpoint else {}
+        init_resume_digests: dict[str, str] = dict(self.checkpoint.get("resume_digests", {})) if self.checkpoint else {}
         records: list[dict[str, Any]] = []
         ctx = _ReadContext(
             url=f"{self.linked_service.settings.host}/{read_info.path}",
             fields_param=fields_param,
-            checksums=checksums,
-            watermarks=watermarks,
+            stable_sort_field=read_info.stable_sort_field,
+            watermark_digests=dict(init_watermark_digests),
+            watermark_changed_since=dict(init_watermark_changed_since),
+            resume_offsets=dict(init_resume_offsets),
+            resume_digests=dict(init_resume_digests),
             records=records,
-            changed_since=read_info.changed_since,
         )
 
-        reader = self._resolve_reader(read_info.pagination)
+        reader = self._resolve_reader(read_info)
         try:
             reader(ctx)
         except (AuthenticationError, AuthorizationError, ConnectionError):
@@ -446,16 +515,26 @@ class TripletexDataset(
             # first, the broader `except ResourceException` below would catch
             # them and reclassify them as ReadError. Re-raising here lets them
             # propagate as themselves instead.
+            self.checkpoint = {
+                "watermark_digests": init_watermark_digests,
+                "watermark_changed_since": init_watermark_changed_since,
+                "resume_offsets": ctx.resume_offsets,
+                "resume_digests": ctx.resume_digests,
+            }
             raise
         except ResourceException as exc:
+            self.checkpoint = {
+                "watermark_digests": init_watermark_digests,
+                "watermark_changed_since": init_watermark_changed_since,
+                "resume_offsets": ctx.resume_offsets,
+                "resume_digests": ctx.resume_digests,
+            }
             product_name = getattr(self.settings.product_name, "value", self.settings.product_name)
             raise ReadError(
                 message=exc.message,
                 status_code=exc.status_code,
                 details={**exc.details, "type": self.type.value, "product_name": product_name, "path": read_info.path},
             ) from exc
-        else:
-            self.checkpoint = {"checksums": checksums, "watermarks": watermarks}
         finally:
             deserializer = cast("PandasDeserializer", self.deserializer)
             output = deserializer(records)
@@ -463,19 +542,12 @@ class TripletexDataset(
                 output = _explode_column(output, column)
             self.output = output
 
-    def _read_paginated(self, ctx: _ReadContext) -> None:
-        """
-        Fetch every page of a ``from``/``count`` offset-paginated product into ``ctx.records``.
-
-        Dispatches to ``_read_paginated_by_changed_since`` (products
-        supporting Tripletex's ``changedSince`` filter) or
-        ``_read_paginated_by_digest`` (``versionDigest``/``If-None-Match``,
-        every other product).
-        """
-        if ctx.changed_since:
-            self._read_paginated_by_changed_since(ctx)
-            return
-        self._read_paginated_by_digest(ctx)
+        self.checkpoint = {
+            "watermark_digests": ctx.watermark_digests,
+            "watermark_changed_since": ctx.watermark_changed_since,
+            "resume_offsets": {},
+            "resume_digests": {},
+        }
 
     def _read_paginated_by_changed_since(self, ctx: _ReadContext) -> None:
         """
@@ -483,23 +555,33 @@ class TripletexDataset(
 
         Tripletex's ``changedSince`` param (format ``YYYY-MM-DDThh:mm:ssZ``)
         filters server-side to only rows changed since that timestamp. The
-        next run's watermark is captured as this run's start time (so
-        concurrent changes aren't missed) and only stored in
-        ``ctx.watermarks`` once every page succeeds.
+        next run's changed_since_watermark is captured as this run's start time and only
+        stored in ``ctx.watermark_changed_since`` once every page succeeds.
+
+        Always starts at ``offset=0`` -- not resumable. ``changedSince``
+        filters a mutable, moving result set, so a stored offset can't be
+        trusted: a row added/removed/updated between attempts can shift
+        every later row's position, risking a silent skip or duplicate.
         """
         extra_params = self.settings.read.params
-        request_key = _request_key(ctx.fields_param, extra_params=extra_params)
-        changed_since_value = ctx.watermarks.get(request_key)
+        request_key = _request_key(ctx.fields_param, stable_sort_field=ctx.stable_sort_field, extra_params=extra_params)
+        changed_since_value = ctx.watermark_changed_since.get(request_key)
         run_started_at = datetime.now(tz=timezone.utc)
         count = self.settings.read.count
         offset = 0
 
+        if changed_since_value is not None:
+            logger.debug("%s: fetching rows changed since %s", request_key, changed_since_value)
+        else:
+            logger.debug("%s: no stored changed_since_watermark, fetching everything", request_key)
+
         while True:
-            params: dict[str, Any] = {"from": offset, "count": count, "fields": ctx.fields_param}
+            params: dict[str, Any] = dict(extra_params) if extra_params else {}
+            params.update({"from": offset, "count": count, "fields": ctx.fields_param})
+            if ctx.stable_sort_field:
+                params["sorting"] = ctx.stable_sort_field
             if changed_since_value is not None:
                 params["changedSince"] = changed_since_value
-            if extra_params:
-                params.update(extra_params)
 
             response = self.linked_service.connection.get(url=ctx.url, params=params)
             body = response.json()
@@ -509,8 +591,7 @@ class TripletexDataset(
 
             ctx.records.extend(values)
             offset += len(values)
-
-        ctx.watermarks[request_key] = run_started_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+        ctx.watermark_changed_since[request_key] = run_started_at.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def _read_paginated_by_digest(self, ctx: _ReadContext) -> None:
         """
@@ -518,7 +599,9 @@ class TripletexDataset(
 
         See ``_fetch_pages_by_digest`` for the mechanism.
         """
-        request_key = _request_key(ctx.fields_param, extra_params=self.settings.read.params)
+        request_key = _request_key(
+            ctx.fields_param, stable_sort_field=ctx.stable_sort_field, extra_params=self.settings.read.params
+        )
         self._fetch_pages_by_digest(ctx, request_key=request_key)
 
     def _fetch_pages_by_digest(
@@ -532,33 +615,75 @@ class TripletexDataset(
         Page through ``ctx.url`` via ``versionDigest``/``If-None-Match``, caching under ``request_key``.
 
         Exits on ``304`` (unchanged); falls back to ``"magic-value"`` since
-        ``versionDigest`` can be JSON ``null``.
+        ``versionDigest`` can be JSON ``null``. Resumes from
+        ``ctx.resume_offsets`` if a prior run failed mid-pagination; cleared
+        once this key's pass completes.
+
+        Pins ``sorting=ctx.stable_sort_field`` (usually ``id``) -- a
+        server-assigned, monotonic field means new rows always append after
+        what's already been seen, never shifting earlier offsets. If it's
+        falsy (``None`` or ``""``, an explicit, deliberate opt-out), no
+        ``sorting`` is sent and this guarantee no longer holds. A resumed
+        offset is trusted only if the digest recorded when it was saved
+        still matches the first resumed response; a mismatch restarts this
+        key from ``offset=0``.
 
         Args:
-            ctx: Read context to append ``records`` into and cache ``checksums`` on.
+            ctx: Read context to append ``records`` into and cache
+                ``watermark_digests``/``resume_offsets``/``resume_digests`` on.
             request_key: Cache key identifying this request shape.
             extra_query_params: Extra query params beyond ``from``/``count``/``fields``.
         """
         extra_params = self.settings.read.params
-        if_none_match = ctx.checksums.get(request_key, "magic-value")
         count = self.settings.read.count
-        offset = 0
+        offset = ctx.resume_offsets.get(request_key, 0)
+        expected_resume_digest = ctx.resume_digests.get(request_key)
+        should_verify_resume = offset != 0
+        if_none_match = "magic-value" if should_verify_resume else ctx.watermark_digests.get(request_key, "magic-value")
         new_digest: str | None = None
 
+        if should_verify_resume:
+            logger.debug(
+                "%s: resuming from offset=%d, verifying against resume_digest=%s",
+                request_key,
+                offset,
+                expected_resume_digest,
+            )
+        else:
+            logger.debug("%s: starting fresh, if_none_match=%s", request_key, if_none_match)
+
         while True:
-            params: dict[str, Any] = {"from": offset, "count": count, "fields": ctx.fields_param}
+            params: dict[str, Any] = dict(extra_params) if extra_params else {}
             if extra_query_params:
                 params.update(extra_query_params)
-            if extra_params:
-                params.update(extra_params)
+            params.update({"from": offset, "count": count, "fields": ctx.fields_param})
+            if ctx.stable_sort_field:
+                params["sorting"] = ctx.stable_sort_field
 
             response = self.linked_service.connection.get(url=ctx.url, params=params, headers={"If-None-Match": if_none_match})
-            if response.status_code == 304:
+            if response.status_code == 304:  # Nothing changed since the last full pass
+                logger.debug("%s: 304 not modified, nothing to fetch", request_key)
                 break
 
             body = response.json()
-            if new_digest is None:
+            if new_digest is None:  # Capture scope wide digest, from the first page only
                 new_digest = body.get("versionDigest") or "magic-value"
+
+            if should_verify_resume:
+                should_verify_resume = False
+                if new_digest != expected_resume_digest:
+                    # Digest differs from what was recorded when that run was
+                    # interrupted -- can't be trusted. Discard this response
+                    # and restart from scratch.
+                    logger.info(
+                        "%s: resume digest mismatch (expected=%s, got=%s) -- restarting from offset=0",
+                        request_key,
+                        expected_resume_digest,
+                        new_digest,
+                    )
+                    offset = 0
+                    new_digest = None
+                    continue
 
             values = body.get("values", [])
             if not values:
@@ -566,9 +691,15 @@ class TripletexDataset(
 
             ctx.records.extend(values)
             offset += len(values)
+            if new_digest != "magic-value":
+                ctx.resume_offsets[request_key] = offset
+                ctx.resume_digests[request_key] = new_digest
 
+        ctx.resume_offsets.pop(request_key, None)
+        ctx.resume_digests.pop(request_key, None)
         if new_digest is not None:
-            ctx.checksums[request_key] = new_digest
+            ctx.watermark_digests[request_key] = new_digest
+            logger.debug("%s: pagination complete, watermark_digest=%s", request_key, new_digest)
 
     def _resolve_date_from(self, *, date_to: date) -> date:
         """
@@ -606,10 +737,9 @@ class TripletexDataset(
 
         Tripletex requires a bounded ``dateFrom``/``dateTo`` per request, so
         this walks the read window in monthly steps, offset-paginating and
-        digest-caching within each. ``ctx.watermarks``/``ctx.changed_since``
-        are never touched here -- no date-windowed product supports
-        ``changedSince`` -- but ``ctx`` is still accepted so the calling
-        convention matches ``_read_paginated``.
+        digest-caching within each. ``ctx.watermark_changed_since`` is never touched here
+        -- but ``ctx`` is still accepted so the calling convention matches
+        ``_resolve_reader``'s other two readers.
 
         Raises:
             ReadError: If ``settings.read.date_from`` is not a valid integer.
@@ -623,6 +753,7 @@ class TripletexDataset(
             period_to_str = period_to.isoformat()
             request_key = _request_key(
                 ctx.fields_param,
+                stable_sort_field=ctx.stable_sort_field,
                 date_from=period_from_str,
                 date_to=period_to_str,
                 extra_params=self.settings.read.params,
@@ -733,9 +864,23 @@ def _build_fields_param(fields: list[Any]) -> str:
     return ",".join(parts)
 
 
+def _field_root_names(fields: list[Any]) -> set[str]:
+    """
+    Top-level names a field selector list selects, whether bare strings or nested-object dict keys.
+
+    Args:
+        fields: Field selector list, e.g. ``["id", {"account": ["id"]}]``.
+
+    Returns:
+        set[str]: ``{"id", "account"}`` for the example above.
+    """
+    return {item if isinstance(item, str) else next(iter(item)) for item in fields}
+
+
 def _request_key(
     fields_param: str,
     *,
+    stable_sort_field: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
     extra_params: dict[str, Any] | None = None,
@@ -751,7 +896,7 @@ def _request_key(
     Returns:
         str: A SHA-256 hex digest identifying this request shape.
     """
-    payload: dict[str, Any] = {"fields": fields_param}
+    payload: dict[str, Any] = {"fields": fields_param, "stable_sort_field": stable_sort_field}
     if date_from is not None:
         payload["dateFrom"] = date_from
         payload["dateTo"] = date_to
